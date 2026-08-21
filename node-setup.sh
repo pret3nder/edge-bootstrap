@@ -1,45 +1,45 @@
 #!/usr/bin/env bash
-# node-setup.sh — доводит ноду Remnawave до рабочего стандарта ПОСЛЕ штатного установщика.
+# node-setup.sh - post-install setup for a Remnawave node. Run after the stock installer.
 #
-#   bash node-setup.sh <домен> [--panel-ip <IP>]
+#   bash node-setup.sh <domain> [--panel-ip <IP>]
 #
-# IP панели определяется автоматически из правила ufw на NODE_PORT.
-# Если правила нет — передай PANEL_IP=<IP> или --panel-ip <IP>.
+# The panel IP is read from the existing ufw rule on NODE_PORT.
+# If there is no such rule, pass PANEL_IP=<IP> or --panel-ip <IP>.
 #
-# Что делает:
-#   1. пинит remnawave/node на проверенную версию (latest ломал XHTTP+REALITY)
-#   2. добавляет в docker-compose монт /etc/letsencrypt в remnanode (нужен Hysteria2/Trojan)
-#   3. кладёт hardened nginx (server_tokens off, probe-404, SPA-fallback, access_log off)
-#   4. ставит правдоподобный сайт-заглушку, разную на каждом домене
-#   5. firewall: наружу только 443 tcp+udp , NODE_PORT только с IP панели
-#   6. генерит ключи и пишет ГОТОВЫЙ Config Profile + значения хостов в файл
+# What it does:
+#   1. pins remnawave/node to a known-good tag and verifies the running core version
+#   2. mounts /etc/letsencrypt into remnanode (Hysteria2 reads the certificate directly)
+#   3. writes a hardened nginx config (server_tokens off, probe-404, SPA fallback, access_log off)
+#   4. installs a small static site, deterministically different per domain
+#   5. firewall: only 80 and 443 tcp+udp exposed; NODE_PORT restricted to the panel IP
+#   6. generates keys and writes a ready-to-paste config profile and host values to a file
 #
-# Набор инбаундов: XHTTP-REALITY (443/tcp) + Hysteria2 (443/udp) .
-# VLESS-PQ и HTTPUpgrade намеренно не ставятся: непопулярны, а лишние порты палят ноду.
+# Inbounds: XHTTP-REALITY (443/tcp) and Hysteria2 (443/udp).
+# VLESS-PQ and HTTPUpgrade are intentionally omitted: extra listening ports add no value here.
 set -euo pipefail
 
-NODE_IMAGE="remnawave/node:2.8.0"     # Xray 26.6.27 — версия, на которой работает парк
+NODE_IMAGE="remnawave/node:2.8.0"     # core version verified after start
 XRAY_EXPECT="26.6.27"
-PANEL_IP="${PANEL_IP:-}"          # см. detect_panel_ip ниже
+PANEL_IP="${PANEL_IP:-}"          # see detect_panel_ip
 DIR="/opt/remnanode"
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
-die(){ red "ОШИБКА: $*"; exit 1; }
+die(){ red "ERROR: $*"; exit 1; }
 
 DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
 while [ $# -gt 0 ]; do
   case "$1" in
     --panel-ip) shift; PANEL_IP="${1:-}" ;;
-    *) die "неизвестный аргумент: $1" ;;
+    *) die "unknown argument: $1" ;;
   esac
   shift
 done
 
-# IP панели: явный флаг --panel-ip -> переменная окружения PANEL_IP ->
-# существующее правило firewall на NODE_PORT (его ставит штатный установщик).
+# Panel IP: --panel-ip flag -> PANEL_IP env var ->
+# existing firewall rule on NODE_PORT (created by the stock installer).
 detect_panel_ip() {
   [ -n "${PANEL_IP:-}" ] && return 0
   command -v ufw >/dev/null 2>&1 || return 1
@@ -51,21 +51,25 @@ detect_panel_ip() {
   [ -n "$PANEL_IP" ]
 }
 
-[ "$(id -u)" = "0" ] || die "нужен root"
-[ -n "$DOMAIN" ] || die "укажи домен: bash node-setup.sh node.example.com"
-[ -d "$DIR" ] || die "$DIR не найден — сначала отработай штатный установщик"
-[ -f "$DIR/docker-compose.yml" ] || die "нет $DIR/docker-compose.yml"
-command -v docker >/dev/null || die "docker не установлен"
-[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] || die "нет сертификата для $DOMAIN"
+[ "$(id -u)" = "0" ] || die "must run as root"
+[ -n "$DOMAIN" ] || die "domain required: bash node-setup.sh node.example.com"
+[ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
+[ -f "$DIR/docker-compose.yml" ] || die "missing $DIR/docker-compose.yml"
+command -v docker >/dev/null || die "docker is not installed"
+[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] || die "no certificate for $DOMAIN"
+
+detect_panel_ip || die "could not determine the panel IP.
+  Via env:  PANEL_IP=1.2.3.4 bash node-setup.sh $DOMAIN
+  Via flag: bash node-setup.sh $DOMAIN --panel-ip 1.2.3.4"
 
 STAMP="$(date +%F-%H%M)"
 echo
-ylw "=== $DOMAIN | образ $NODE_IMAGE ==="
+ylw "=== $DOMAIN | image $NODE_IMAGE ==="
 
 # ---------- 1. docker-compose ----------
 cp "$DIR/docker-compose.yml" "$DIR/docker-compose.yml.bak-$STAMP"
 sed -i -E "s|image:[[:space:]]*remnawave/node:[^[:space:]]+|image: $NODE_IMAGE|" "$DIR/docker-compose.yml"
-grep -q "image: $NODE_IMAGE" "$DIR/docker-compose.yml" || die "не удалось запинить образ"
+grep -q "image: $NODE_IMAGE" "$DIR/docker-compose.yml" || die "failed to pin the image"
 
 if ! grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml"; then
   awk '
@@ -79,12 +83,12 @@ if ! grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml"; then
   ' "$DIR/docker-compose.yml" > "$DIR/.dc.tmp" && mv "$DIR/.dc.tmp" "$DIR/docker-compose.yml"
 fi
 if grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml"; then
-  grn "  compose: образ запинен, монт сертов на месте"
+  grn "  compose: image pinned, certificate mount present"
 else
-  ylw "  compose: монт /etc/letsencrypt добавить не удалось — проверь вручную"
+  ylw "  compose: could not add the /etc/letsencrypt mount - check manually"
 fi
 
-# ---------- 2. hardened nginx (без HTU-локации) ----------
+# ---------- 2. hardened nginx ----------
 [ -f "$DIR/nginx.conf" ] && cp "$DIR/nginx.conf" "$DIR/nginx.conf.bak-$STAMP"
 {
   echo 'server_names_hash_bucket_size 64;'
@@ -141,9 +145,9 @@ fi
   echo '    return 444;'
   echo '}'
 } > "$DIR/nginx.conf"
-grn "  nginx: hardened записан (HTU-локации нет — транспорт выведен из эксплуатации)"
+grn "  nginx: hardened config written"
 
-# ---------- 3. сайт-заглушка ----------
+# ---------- 3. static site ----------
 mkdir -p /var/www/html
 H=$(printf '%s' "$DOMAIN" | md5sum | tr -dc '0-9' | cut -c1-6)
 [ -z "$H" ] && H=1
@@ -205,7 +209,7 @@ YEAR=$(( 2016 + 10#$H % 8 ))
   echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/privacy\">Privacy</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>"
   echo '</body></html>'
 } > /var/www/html/index.html
-grn "  заглушка: $BN"
+grn "  static site: $BN"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
@@ -218,12 +222,12 @@ if command -v ufw >/dev/null; then
   ufw allow 80/tcp  >/dev/null
   ufw allow from "$PANEL_IP" to any port 2222 proto tcp >/dev/null
   ufw reload >/dev/null
-  grn "  firewall: 443 tcp+udp, 80, 2222 только с $PANEL_IP"
+  grn "  firewall: 80, 443 tcp+udp; 2222 restricted to $PANEL_IP"
 else
-  ylw "  ufw не найден — открой порты вручную"
+  ylw "  ufw not found - open the ports manually"
 fi
 
-# ---------- 5. пересоздать и проверить ----------
+# ---------- 5. recreate containers and verify ----------
 cd "$DIR"
 docker compose pull >/dev/null 2>&1 || true
 docker compose up -d --force-recreate >/dev/null
@@ -234,19 +238,19 @@ for _ in $(seq 1 15); do
   sleep 2
 done
 if [ "$V" = "$XRAY_EXPECT" ]; then
-  grn "  Xray $V — совпадает с парком"
+  grn "  core $V - matches the expected version"
 else
-  red "  Xray '${V:-не определилась}', ожидалась $XRAY_EXPECT — XHTTP+REALITY может не работать"
+  red "  Xray '${V:-unknown}', expected $XRAY_EXPECT - XHTTP+REALITY may not work"
 fi
 if docker exec remnawave-nginx grep -qc server_tokens /etc/nginx/conf.d/default.conf 2>/dev/null; then
-  grn "  nginx: контейнер читает новый конфиг"
+  grn "  nginx: container is reading the new config"
 else
-  red "  nginx: контейнер видит СТАРЫЙ конфиг (маунт по inode)"
+  red "  nginx: container still sees the OLD config (inode-bound mount)"
 fi
 
-# ---------- 5b. обновление сертификата: standalone -> webroot ----------
-# nginx теперь держит :80, поэтому certbot --standalone при продлении упадёт.
-# Переводим на webroot и сразу проверяем dry-run; не вышло — откатываем.
+# ---------- 5b. certificate renewal: standalone -> webroot ----------
+# nginx now holds :80, so certbot --standalone would fail on renewal.
+# Switch to webroot and verify with a dry run; revert if it fails.
 RCONF="/etc/letsencrypt/renewal/${DOMAIN}.conf"
 if [ -f "$RCONF" ] && command -v certbot >/dev/null; then
   if grep -q '^authenticator[[:space:]]*=[[:space:]]*standalone' "$RCONF"; then
@@ -254,24 +258,24 @@ if [ -f "$RCONF" ] && command -v certbot >/dev/null; then
     sed -i -E 's|^authenticator[[:space:]]*=.*|authenticator = webroot|' "$RCONF"
     grep -q '^webroot_path' "$RCONF" && sed -i -E 's|^webroot_path[[:space:]]*=.*|webroot_path = /var/www/html,|' "$RCONF"                                      || sed -i -E '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RCONF"
     if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
-      grn "  сертификат: продление переведено на webroot, dry-run прошёл"
+      grn "  certificate: renewal switched to webroot, dry run passed"
     else
       cp "${RCONF}.bak-$STAMP" "$RCONF"
-      red "  сертификат: webroot не заработал, откатил на standalone."
-      red "              При таком раскладе продление конфликтует с nginx на :80 — проверь вручную!"
+      red "  certificate: webroot failed, reverted to standalone."
+      red "              Renewal now conflicts with nginx on :80 - fix this manually!"
     fi
   else
     if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
-      grn "  сертификат: продление работает"
+      grn "  certificate: renewal works"
     else
-      ylw "  сертификат: dry-run продления не прошёл — проверь 'certbot renew --dry-run'"
+      ylw "  certificate: renewal dry run failed - check 'certbot renew --dry-run'"
     fi
   fi
 else
-  ylw "  сертификат: renewal-конфиг или certbot не найдены, продление не проверено"
+  ylw "  certificate: renewal config or certbot not found, renewal not verified"
 fi
 
-# ---------- 6. ключи и данные для панели ----------
+# ---------- 6. keys and panel values ----------
 KEYS=$(docker exec remnanode xray x25519 2>/dev/null || true)
 PRIV=$(printf '%s' "$KEYS" | grep -i 'private' | awk '{print $NF}')
 PUB=$(printf '%s' "$KEYS" | grep -i 'public' | awk '{print $NF}')
@@ -290,9 +294,9 @@ KEYF="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 OUT="/root/${DOMAIN}-panel.txt"
 
 {
-  echo "================ $DOMAIN — данные для панели ================"
+  echo "================ $DOMAIN - panel values ================"
   echo
-  echo "--- Config Profile: вставить целиком ---"
+  echo "--- config profile: paste as a whole ---"
   echo '{'
   echo '  "log": { "loglevel": "warning" },'
   echo '  "dns": { "servers": [{ "address": "https://1.1.1.1/dns-query", "skipFallback": false }, "1.1.1.1"],'
@@ -342,12 +346,12 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '}'
   echo
   echo "--- Host: $DOMAIN [xhttp] ---"
-  echo "Инбаунд    : XHTTP-REALITY-$SUF"
-  echo "Адрес/Порт : $DOMAIN / 443"
+  echo "Inbound    : XHTTP-REALITY-$SUF"
+  echo "Address    : $DOMAIN / 443"
   echo "SNI        : $DOMAIN"
-  echo "Отпечаток  : firefox"
-  echo "Путь/ALPN  : пусто (берётся из инбаунда)"
-  echo "Кнопка xHTTP:"
+  echo "Fingerprint: firefox"
+  echo "Path/ALPN  : leave empty (taken from the inbound)"
+  echo "xHTTP button:"
   echo "{ \"xmux\": { \"maxConnections\": \"2\", \"cMaxReuseTimes\": \"128-256\", \"hKeepAlivePeriod\": 45,"
   echo "            \"hMaxRequestTimes\": \"600-900\", \"hMaxReusableSecs\": \"1800-3600\" },"
   echo "  \"seqKey\": \"$SEQ\", \"seqPlacement\": \"path\", \"sessionKey\": \"$SES\", \"sessionPlacement\": \"path\","
@@ -356,12 +360,12 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "  \"headers\": { \"User-Agent\": \"$UA\" }, \"xPaddingBytes\": \"100-1000\" }"
   echo
   echo "--- Host: $DOMAIN [hy2] ---"
-  echo "Инбаунд    : HYSTERIA-$SUF"
-  echo "Адрес/Порт : $DOMAIN / 443     ALPN: h3"
-  echo "Кнопка Final Mask:"
+  echo "Inbound    : HYSTERIA-$SUF"
+  echo "Address    : $DOMAIN / 443     ALPN: h3"
+  echo "Final Mask button:"
   echo "{ \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\" } }"
   echo
-  echo "--- ключи ноды ---"
+  echo "--- node keys ---"
   echo "REALITY privateKey : $PRIV"
   echo "REALITY publicKey  : $PUB"
   echo "shortId            : $SID"
@@ -370,11 +374,11 @@ OUT="/root/${DOMAIN}-panel.txt"
 chmod 600 "$OUT"
 
 echo
-grn "=== готово ==="
-echo "Данные для панели: $OUT"
+grn "=== done ==="
+echo "Panel values: $OUT"
 echo
-ylw "Проверка снаружи:"
+ylw "Verify from outside:"
 echo "  curl -sI https://$DOMAIN/ | head -2"
 echo "  curl -so /dev/null -w '%{http_code}\\n' https://$DOMAIN/wp-admin"
 echo
-ylw "Дальше в панели: Config Profile из файла -> хосты по описанию оттуда же."
+ylw "Next: paste the config profile from that file into the panel, then add the hosts."

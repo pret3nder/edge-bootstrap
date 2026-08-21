@@ -1,85 +1,71 @@
-# remnanode-setup
+# edge-bootstrap
 
-Доводчик ноды Remnawave до рабочего стандарта. Запускается **после** штатного установщика,
-не заменяет его.
-
-```bash
-bash node-setup.sh <домен> [--panel-ip <IP>]
-```
-
-## Зачем
-
-Штатный установщик поднимает ноду, но оставляет её в состоянии, которое приходится
-доводить руками: образ на `latest`, nginx без hardening, лишние порты наружу,
-ключи и конфиг для панели надо собирать самому. Скрипт закрывает всё это за один прогон.
-
-## Что делает
-
-1. **Пинит образ** на `remnawave/node:2.8.0` (Xray 26.6.27) и проверяет версию после старта.
-   `latest` тянет 3.x с Xray 26.7.x, где сломан XHTTP+REALITY (XTLS #6482) — нода поднимется,
-   но два инбаунда работать не будут.
-2. **Чинит docker-compose** — добавляет монт `/etc/letsencrypt` в `remnanode`.
-   Без него Hysteria2 и Trojan не прочитают сертификат.
-3. **Кладёт hardened nginx**: `server_tokens off`, 404 на сканерские пути, SPA-fallback,
-   `access_log off` (в логи шли в основном пробы и сканеры — до 500 МБ на контейнер).
-4. **Ставит сайт-заглушку**, детерминированно разную на каждом домене. Одинаковая страница
-   на нескольких IP сама по себе выдаёт ферму.
-5. **Настраивает firewall**: наружу только `443/tcp`, `443/udp` и `80/tcp`.
-   `NODE_PORT` — только с IP панели; широкие правила на 2222 удаляются.
-6. **Генерит ключи** и пишет готовый Config Profile + значения хостов в `/root/<домен>-panel.txt`.
-
-## Набор инбаундов
-
-Только два: `XHTTP-REALITY` (443/tcp) и `Hysteria2` (443/udp).
-
-**VLESS-PQ, HTTPUpgrade и Trojan не ставятся.** Принцип — никаких аномалий, которые
-видно при сканировании:
-
-- **PQ на 2053** отдавал байт-в-байт тот же сайт и тот же сертификат, что и 443.
-  Сайтов-близнецов на двух портах не бывает — готовая зацепка.
-- **Trojan на 8443** — порт-сирота: TLS с сертификатом домена, но без HTTP.
-- **HTTPUpgrade** — известный fingerprint по ALPN `http/1.1`, плюс требовал
-  `proxy_pass` в nginx (источник инцидента с маунтом по inode).
-
-Оба заодно стоили по хосту в панели и лишнего шага при развёртывании.
-
-Итог: наружу открыты **80 и 443** — ровно как у обычного сайта. На 80 nginx отдаёт
-редирект на https и ACME-челлендж; 443/tcp — REALITY с фоллбэком в сайт-заглушку;
-443/udp — Hysteria2 под salamander, снаружи выглядит как отсутствие HTTP/3.
-
-## После прогона
-
-1. Открыть `/root/<домен>-panel.txt`.
-2. Config Profile из файла → в панель.
-3. Завести два хоста по описанию оттуда же.
-
-Проверка снаружи:
+Post-install setup for a Remnawave node. Run it **after** the stock installer —
+it does not replace it.
 
 ```bash
-curl -sI https://<домен>/ | head -2                                # 200, в server: без версии
-curl -so /dev/null -w '%{http_code}\n' https://<домен>/wp-admin     # 404
+bash node-setup.sh <domain> [--panel-ip <IP>]
 ```
 
-XHTTP проверяется только подключением реального клиента — снаружи его не пощупать.
+## Why
 
-## Продление сертификата
+The stock installer brings a node up, but leaves it in a state that needs manual
+follow-up: the image floats on `latest`, nginx ships without hardening, more ports
+are exposed than necessary, and the config profile has to be assembled by hand.
+This script closes all of that in one pass.
 
-nginx теперь занимает `:80`, а установщик обычно настраивает продление через
-`certbot --standalone`, которому этот же порт нужен монопольно. Скрипт переводит
-продление на `webroot` и сразу проверяет `certbot renew --dry-run`. Если проверка
-не прошла — конфиг откатывается на `standalone` и печатается предупреждение:
-в этом случае продление надо чинить руками, иначе сертификат тихо умрёт через 90 дней.
+## What it does
 
-## Идемпотентность и откат
+1. **Pins the node image** to a known-good tag and verifies the core version after start.
+   `latest` can pull a newer core where XHTTP over REALITY is broken
+   ([XTLS/Xray-core#6482](https://github.com/XTLS/Xray-core/issues/6482)) — the node
+   starts fine, but two inbounds silently do nothing.
+2. **Fixes docker-compose** — adds the `/etc/letsencrypt` mount to `remnanode`.
+   Without it Hysteria2 cannot read the certificate.
+3. **Writes a hardened nginx config**: `server_tokens off`, 404 on common scanner paths,
+   SPA fallback, `access_log off` (the access log is mostly scanner noise and can grow
+   to hundreds of megabytes per container).
+4. **Installs a small static site**, deterministically different per domain.
+5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
+   `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
+   is removed.
+6. **Generates keys** and writes a ready-to-paste config profile plus host values to
+   `/root/<domain>-panel.txt`.
 
-Прогон повторяем. Перед перезаписью делаются бэкапы:
-`docker-compose.yml.bak-<дата>`, `nginx.conf.bak-<дата>`.
+## Inbounds
 
-⚠️ Ключи при каждом прогоне **новые**. Для уже работающей ноды это отвяжет клиентов —
-скрипт рассчитан на первичную настройку. При переезде ноды на новый сервер ключи
-переиспользуются из панели, генерировать заново нельзя.
+`XHTTP-REALITY` on 443/tcp and `Hysteria2` on 443/udp.
 
-## Требования
+VLESS-PQ and HTTPUpgrade are intentionally omitted. Each cost an extra host entry per
+node, and PQ on a secondary port served a byte-identical site and certificate to 443 —
+the same content on two ports is an odd thing to expose. With those gone the node
+listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
+443/tcp serves the site, 443/udp answers nothing unless it recognises the traffic.
 
-Ubuntu/Debian, root, docker + compose v2, выпущенный сертификат для домена,
-установленная нода в `/opt/remnanode`.
+## Panel IP
+
+Read automatically from the existing ufw rule on `NODE_PORT`, which the stock installer
+already creates. Override with the `PANEL_IP` environment variable or `--panel-ip`.
+If none of the three yields an address, the script stops instead of guessing.
+
+## Certificate renewal
+
+nginx takes `:80`, while the installer usually configures renewal through
+`certbot --standalone`, which needs that port exclusively. The script converts renewal
+to `webroot` and verifies it with `certbot renew --dry-run`. If the check fails it
+reverts to `standalone` and prints a warning — a silent failure here would only surface
+when the certificate expires.
+
+## Re-runs and rollback
+
+Safe to re-run. Backups are written before anything is overwritten:
+`docker-compose.yml.bak-<date>`, `nginx.conf.bak-<date>`, `<domain>.conf.bak-<date>`.
+
+⚠️ Keys are regenerated on every run. On a node that already has clients this will
+disconnect them — the script is meant for initial setup. When moving an existing node
+to a new host, reuse the keys from the panel instead.
+
+## Requirements
+
+Ubuntu or Debian, root, docker with compose v2, a certificate already issued for the
+domain, and a node installed in `/opt/remnanode`.

@@ -139,9 +139,13 @@ cmd_check() {
   # The mount names a fixed path; repointing the node without updating it leaves
   # nginx loading a certificate that is no longer there.
   out=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | head -1 | cut -d/ -f5 || true)
-  if [ -n "$out" ] && [ -n "$d" ] && [ "$out" != "$d" ]; then
+  # A wildcard is stored under the apex, so a mount naming the parent of the
+  # served domain is correct and must not be reported as a mismatch.
+  if [ -n "$out" ] && [ -n "$d" ] && [ "$out" != "$d" ] && [ "${d%".$out"}" = "$d" ]; then
     red "  compose: certificate mount points at $out, node serves $d"
     fails=$((fails + 1))
+  elif [ -n "$out" ] && [ "$out" != "$d" ]; then
+    grn "  compose: certificate mount uses the wildcard for $out"
   fi
   if ! grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml" 2>/dev/null; then
     red "  compose: /etc/letsencrypt is not mounted into remnanode - Hysteria2 cannot read the certificate"
@@ -221,6 +225,7 @@ menu() {
     printf '    1) set up / reconfigure this node\n' >/dev/tty
     printf '    2) health check\n' >/dev/tty
     printf '    3) show panel values\n' >/dev/tty
+    printf '    4) export certificate bundle for other nodes\n' >/dev/tty
     printf '    0) exit\n' >/dev/tty
     printf '  choice: ' >/dev/tty
     read -r choice </dev/tty || return 1
@@ -228,8 +233,9 @@ menu() {
       1) ACTION=setup; return 0 ;;
       2) ACTION=check; return 0 ;;
       3) ACTION=panel; return 0 ;;
+      4) ACTION=cert-export; return 0 ;;
       0) exit 0 ;;
-      *) red "  pick 0-3" >/dev/tty ;;
+      *) red "  pick 0-4" >/dev/tty ;;
     esac
   done
 }
@@ -306,8 +312,8 @@ services:
     network_mode: host
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - /etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/$DOMAIN/fullchain.pem:ro
-      - /etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/$DOMAIN/privkey.pem:ro
+      - /etc/letsencrypt/live/$CERTNAME/fullchain.pem:/etc/nginx/ssl/$CERTNAME/fullchain.pem:ro
+      - /etc/letsencrypt/live/$CERTNAME/privkey.pem:/etc/nginx/ssl/$CERTNAME/privkey.pem:ro
       - /dev/shm:/dev/shm:rw
       - /var/www/html:/var/www/html:ro
     command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
@@ -329,26 +335,54 @@ services:
 COMPOSE
   chmod 600 "$DIR/docker-compose.yml"
   grn "  node installed in $DIR"
-}
 
+# Pack this node's certificate for the rest of the fleet. Let's Encrypt caps
+# identical certificates at five a week, so one host issues the wildcard and
+# every other node imports the result rather than asking for its own.
+cmd_cert_export() {
+  local out="${1:-}" name
+  name=$(grep -m1 -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | cut -d/ -f5 || true)
+  [ -n "$name" ] || die "cannot tell which certificate this node uses - no $DIR/docker-compose.yml?"
+  [ -f "/etc/letsencrypt/live/$name/fullchain.pem" ] || die "no certificate at /etc/letsencrypt/live/$name"
+  [ -n "$out" ] || out="/root/$name-cert.tgz"
+  # -h dereferences: live/ holds symlinks into archive/, and the targets have to travel.
+  tar -czhf "$out" -C /etc/letsencrypt/live "$name" 2>/dev/null || die "could not write $out"
+  chmod 600 "$out"
+  grn "certificate bundle written: $out"
+  openssl x509 -in "/etc/letsencrypt/live/$name/fullchain.pem" -noout -subject -enddate 2>/dev/null | sed 's/^/  /'
+  echo
+  echo "  Copy it to another node, then there:"
+  echo "    rr <node-domain> --cert-mode dns --cert-bundle /root/$(basename "$out")"
+  echo
+  echo "  Renewal stays on this host. Re-export and re-import before expiry."
+}
+}
 # First positional argument is either a sub-command or the domain.
 ACTION=setup
 case "${1:-}" in
   check|panel|setup) ACTION="$1"; shift ;;
+  cert-export)       ACTION=cert-export; shift ;;
   menu)              ACTION=menu; shift ;;
 esac
+
+CERT_MODE=http
+GCORE_TOKEN="${GCORE_API_TOKEN:-}"
 
 DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
 while [ $# -gt 0 ]; do
   case "$1" in
-    --panel-ip)   shift; PANEL_IP="${1:-}" ;;
-    --email)      shift; EMAIL="${1:-}" ;;
-    --force-cert) FORCE_CERT=1 ;;
-    --keep-certs) KEEP_CERTS=1 ;;
-    --new-site)   NEW_SITE=1 ;;
-    --brand)      shift; BRAND="${1:-}" ;;
-    --secret-key) shift; SECRET_KEY="${1:-}" ;;
+    --panel-ip)    shift; PANEL_IP="${1:-}" ;;
+    --email)       shift; EMAIL="${1:-}" ;;
+    --force-cert)  FORCE_CERT=1 ;;
+    --keep-certs)  KEEP_CERTS=1 ;;
+    --new-site)    NEW_SITE=1 ;;
+    --brand)       shift; BRAND="${1:-}" ;;
+    --secret-key)  shift; SECRET_KEY="${1:-}" ;;
+    --cert-mode)   shift; CERT_MODE="${1:-}" ;;
+    --gcore-token) shift; GCORE_TOKEN="${1:-}" ;;
+    --cert-bundle) shift; CERT_BUNDLE="${1:-}" ;;
+    --apex)        shift; APEX_OVERRIDE="${1:-}" ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -383,6 +417,7 @@ fi
 case "$ACTION" in
   check) cmd_check "$DOMAIN"; exit 0 ;;
   panel) cmd_panel "$DOMAIN"; exit $? ;;
+  cert-export) cmd_cert_export "$DOMAIN"; exit 0 ;;
 esac
 
 # ---- from here on: setup ----
@@ -390,6 +425,26 @@ if [ -z "$DOMAIN" ]; then
   ask "Node domain (selfsteal domain used during installation)" DOMAIN "$RE_DOMAIN"     || die "domain required: bash node-setup.sh node.example.com"
 fi
 printf "%s" "$DOMAIN" | grep -qE "$RE_DOMAIN" || die "not a valid domain: $DOMAIN"
+
+# Which certificate this node runs on, and which name it has to contain.
+# http: one per node, named after the node. dns: one wildcard for the apex,
+# shared by the fleet. Everything downstream - the compose mounts, the nginx
+# paths, the renewal config, the Hysteria2 certificate - keys off CERTNAME.
+case "$CERT_MODE" in
+  http)
+    CERTNAME="$DOMAIN"; CERTWANT="$DOMAIN"; APEX="$DOMAIN" ;;
+  dns)
+    APEX="${APEX_OVERRIDE:-${DOMAIN#*.}}"
+    # Stripping one label is right for node.example.com and wrong for anything
+    # under a multi-part suffix, so the guess is checked and can be overridden.
+    [ "$APEX" != "$DOMAIN" ] || die "--cert-mode dns needs a node under an apex, got $DOMAIN.
+  Name the zone explicitly if the guess cannot work: --apex example.com"
+    printf '%s' "$APEX" | grep -qE '^[a-z0-9-]+\.[a-z]{2,}$' \
+      || ylw "  certificate: apex guessed as $APEX - pass --apex if that is wrong"
+    CERTNAME="$APEX"; CERTWANT="*.$APEX" ;;
+  *)
+    die "unknown --cert-mode: $CERT_MODE (expected http or dns)" ;;
+esac
 
 # Domain is known now, so the compose file can name the right certificate paths.
 [ "$NEED_INSTALL" = "1" ] && install_node
@@ -436,10 +491,10 @@ fi
 # no longer exists, docker helpfully creates a directory there, and the container
 # ends up in a restart loop.
 OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | cut -d/ -f5 || true)
-if [ -n "$OLDCERT" ] && [ "$OLDCERT" != "$DOMAIN" ]; then
-  sed -i -E "s|/etc/letsencrypt/live/[^/]+/(fullchain\|privkey)\.pem:/etc/nginx/ssl/[^/]+/(fullchain\|privkey)\.pem|/etc/letsencrypt/live/$DOMAIN/\1.pem:/etc/nginx/ssl/$DOMAIN/\2.pem|g" \
+if [ -n "$OLDCERT" ] && [ "$OLDCERT" != "$CERTNAME" ]; then
+  sed -i -E "s|/etc/letsencrypt/live/[^/]+/(fullchain\|privkey)\.pem:/etc/nginx/ssl/[^/]+/(fullchain\|privkey)\.pem|/etc/letsencrypt/live/$CERTNAME/\1.pem:/etc/nginx/ssl/$CERTNAME/\2.pem|g" \
       "$DIR/docker-compose.yml"
-  grn "  compose: certificate mounts repointed $OLDCERT -> $DOMAIN"
+  grn "  compose: certificate mounts repointed $OLDCERT -> $CERTNAME"
 fi
 
 # Clear placeholders docker created where a certificate file was expected but missing.
@@ -477,9 +532,9 @@ done
   echo '    listen unix:/dev/shm/nginx.sock ssl proxy_protocol;'
   echo '    http2 on;'
   echo ''
-  echo "    ssl_certificate         \"/etc/nginx/ssl/$DOMAIN/fullchain.pem\";"
-  echo "    ssl_certificate_key     \"/etc/nginx/ssl/$DOMAIN/privkey.pem\";"
-  echo "    ssl_trusted_certificate \"/etc/nginx/ssl/$DOMAIN/fullchain.pem\";"
+  echo "    ssl_certificate         \"/etc/nginx/ssl/$CERTNAME/fullchain.pem\";"
+  echo "    ssl_certificate_key     \"/etc/nginx/ssl/$CERTNAME/privkey.pem\";"
+  echo "    ssl_trusted_certificate \"/etc/nginx/ssl/$CERTNAME/fullchain.pem\";"
   echo ''
   echo '    root   /var/www/html;'
   echo '    index  index.html;'
@@ -796,32 +851,177 @@ else
 fi
 
 # ---------- 4b. certificate ----------
+# Two ways to get one, chosen with --cert-mode:
+#
+#   http (default)   certbot --standalone, one certificate per node, named after
+#                    the node. Self-contained, needs nothing but port 80 — and
+#                    every issuance publishes the node's hostname to the
+#                    Certificate Transparency logs, where anyone can read it.
+#
+#   dns              one wildcard for *.<apex>, shared by every node. CT then
+#                    shows the wildcard and nothing else, so node hostnames stop
+#                    being enumerable from crt.sh. Validated over DNS-01 against
+#                    the Gcore API, so the apex zone has to live in Gcore.
+#
+# Let's Encrypt allows five identical certificates per week, which is fewer than
+# the fleet, so the nodes cannot each issue the same wildcard. One host issues
+# and the others import: `rr cert-export` there, `--cert-bundle` here.
+#
 # Runs after the firewall opened :80 and before nginx is (re)started, because
-# certbot --standalone needs that port to itself.
+# --standalone needs that port to itself.
 
 cert_ok() {
-  local d="$1" f="/etc/letsencrypt/live/$1/fullchain.pem"
+  local n="$1" want="$2" f="/etc/letsencrypt/live/$1/fullchain.pem"
   [ -f "$f" ] || return 1
   openssl x509 -in "$f" -noout -checkend 604800 >/dev/null 2>&1 || return 1   # >7 days left
-  openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q "DNS:$d" || return 1
+  # -F, not a regex: the wildcard name starts with a character grep would eat.
+  openssl x509 -in "$f" -noout -text 2>/dev/null | grep -qF "DNS:$want" || return 1
 }
+
+install_bundle() {
+  local b="$1"
+  [ -f "$b" ] || die "certificate bundle not found: $b"
+  mkdir -p /etc/letsencrypt/live
+  tar -xzf "$b" -C /etc/letsencrypt/live 2>/dev/null || die "cannot unpack $b"
+  cert_ok "$CERTNAME" "$CERTWANT" || die "the bundle in $b does not contain a valid certificate for $CERTWANT"
+  grn "  certificate: imported from $b"
+}
+
+write_gcore_hook() {
+  cat > "$HOOKF" <<'GCORE_HOOK'
+#!/usr/bin/env bash
+# ACME DNS-01 hook for Gcore. certbot calls it as `hook auth` and `hook cleanup`
+# with CERTBOT_DOMAIN and CERTBOT_VALIDATION in the environment.
+#
+# A wildcard order asks for *.example.com and example.com, and both challenges
+# answer on the same _acme-challenge.example.com. The second value has to be
+# added to the first, never replace it, or the earlier authorization fails.
+#
+# The token is read from the environment when present and from disk otherwise,
+# because renewal runs from a systemd timer that carries none of our variables.
+set -uo pipefail
+API="https://api.gcore.com/dns/v2"
+TOKEN="${GCORE_API_TOKEN:-}"
+[ -n "$TOKEN" ] && : || TOKEN=$(cat /opt/remnanode/.gcore-token 2>/dev/null || true)
+[ -n "$TOKEN" ] || { echo "no Gcore API token in GCORE_API_TOKEN or /opt/remnanode/.gcore-token" >&2; exit 1; }
+
+RESP=""; CODE=""
+api() {
+  local m="$1" p="$2" b="${3:-}" out
+  if [ -n "$b" ]; then
+    out=$(curl -sS --max-time 30 -X "$m" "$API/$p" -H "Authorization: APIKey $TOKEN" \
+               -H 'Content-Type: application/json' -d "$b" -w '\n%{http_code}' 2>/dev/null)
+  else
+    out=$(curl -sS --max-time 30 -X "$m" "$API/$p" -H "Authorization: APIKey $TOKEN" \
+               -w '\n%{http_code}' 2>/dev/null)
+  fi
+  CODE=$(printf '%s' "$out" | tail -n1)
+  RESP=$(printf '%s' "$out" | sed '$d')
+}
+
+D="${CERTBOT_DOMAIN:-}"; V="${CERTBOT_VALIDATION:-}"
+[ -n "$D" ] || { echo "CERTBOT_DOMAIN is empty" >&2; exit 1; }
+REC="_acme-challenge.$D"
+
+# Walk the labels upward until Gcore recognises one as a zone.
+ZONE=""; c="$D"
+while [ -n "$c" ]; do
+  api GET "zones/$c"
+  if [ "$CODE" = "200" ]; then ZONE="$c"; break; fi
+  case "$c" in *.*) c="${c#*.}" ;; *) c="" ;; esac
+done
+[ -n "$ZONE" ] || { echo "no Gcore zone covers $D" >&2; exit 1; }
+
+api GET "zones/$ZONE/$REC/TXT"
+EXISTS=0; [ "$CODE" = "200" ] && EXISTS=1
+CURRENT=$(printf '%s' "$RESP" | tr '}' '\n' | sed -n 's/.*"content":\["\([^"]*\)".*/\1/p')
+
+payload() {   # values on stdin -> rrset JSON
+  local out="" first=1 v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    [ "$first" = 1 ] || out="$out,"
+    out="$out{\"content\":[\"$v\"],\"enabled\":true}"
+    first=0
+  done
+  printf '{"ttl":120,"resource_records":[%s]}' "$out"
+}
+
+case "${1:-auth}" in
+  auth)
+    WANT=$(printf '%s\n%s\n' "$CURRENT" "$V" | sed '/^$/d' | sort -u)
+    BODY=$(printf '%s\n' "$WANT" | payload)
+    if [ "$EXISTS" = 1 ]; then api PUT "zones/$ZONE/$REC/TXT" "$BODY"
+    else                        api POST "zones/$ZONE/$REC/TXT" "$BODY"; fi
+    case "$CODE" in 2*) : ;; *) echo "Gcore rejected the record ($CODE): $RESP" >&2; exit 1 ;; esac
+    # Wait for it to be visible publicly. certbot validates for real afterwards,
+    # so a timeout here is worth a warning and not an abort.
+    for _ in $(seq 1 40); do
+      if curl -s --max-time 10 -H 'accept: application/dns-json' \
+              "https://dns.google/resolve?name=$REC&type=TXT" 2>/dev/null | grep -qF "$V"; then
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "warning: $REC did not show up in public DNS within 200s, trying anyway" >&2
+    ;;
+  cleanup)
+    [ "$EXISTS" = 1 ] || exit 0
+    LEFT=$(printf '%s\n' "$CURRENT" | sed '/^$/d' | grep -vxF "$V" || true)
+    if [ -z "$LEFT" ]; then
+      api DELETE "zones/$ZONE/$REC/TXT"
+    else
+      api PUT "zones/$ZONE/$REC/TXT" "$(printf '%s\n' "$LEFT" | payload)"
+    fi
+    ;;
+esac
+exit 0
+GCORE_HOOK
+  chmod 700 "$HOOKF"
+}
+
+HOOKF="$DIR/acme-gcore.sh"
 
 # Certificates left over from a previous domain: this node serves exactly one.
 if [ "${KEEP_CERTS:-0}" != "1" ]; then
   for c in $(certbot certificates 2>/dev/null | sed -n 's/^[[:space:]]*Certificate Name:[[:space:]]*//p'); do
-    [ "$c" = "$DOMAIN" ] && continue
+    [ "$c" = "$CERTNAME" ] && continue
     ylw "  certificate: removing stale cert for $c"
     certbot delete --cert-name "$c" --non-interactive >/dev/null 2>&1 || true
   done
 fi
 
-if [ "${FORCE_CERT:-0}" = "1" ] && [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+if [ "${FORCE_CERT:-0}" = "1" ] && [ -d "/etc/letsencrypt/live/$CERTNAME" ]; then
   ylw "  certificate: --force-cert given, dropping the existing one"
-  certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
+  certbot delete --cert-name "$CERTNAME" --non-interactive >/dev/null 2>&1 || true
+  rm -rf "/etc/letsencrypt/live/$CERTNAME"
 fi
 
-if cert_ok "$DOMAIN"; then
+if [ -n "${CERT_BUNDLE:-}" ]; then
+  install_bundle "$CERT_BUNDLE"
+elif cert_ok "$CERTNAME" "$CERTWANT"; then
   grn "  certificate: existing one is valid, reusing it"
+elif [ "$CERT_MODE" = "dns" ]; then
+  [ -n "${GCORE_TOKEN:-}" ] || { can_ask && ask "Gcore API token (DNS-01 validation)" GCORE_TOKEN '.\{8,\}'; }
+  [ -n "${GCORE_TOKEN:-}" ] || die "--cert-mode dns needs a Gcore API token (--gcore-token, GCORE_API_TOKEN,
+  or an existing /opt/remnanode/.gcore-token). Alternatively issue the wildcard on
+  one host and bring it here with --cert-bundle."
+  printf '%s\n' "$GCORE_TOKEN" > "$DIR/.gcore-token"
+  chmod 600 "$DIR/.gcore-token"
+  write_gcore_hook
+  EMAILARG="--register-unsafely-without-email"
+  [ -n "${EMAIL:-}" ] && EMAILARG="-m $EMAIL"
+  GCORE_API_TOKEN="$GCORE_TOKEN" certbot certonly --manual --preferred-challenges dns \
+      --manual-auth-hook "$HOOKF auth" --manual-cleanup-hook "$HOOKF cleanup" \
+      --cert-name "$CERTNAME" -d "*.$APEX" -d "$APEX" \
+      --agree-tos --non-interactive $EMAILARG >/dev/null 2>&1 || true
+  cert_ok "$CERTNAME" "$CERTWANT" || die "could not obtain the wildcard for $CERTWANT.
+  Check that $APEX is hosted in Gcore and the token may edit its records.
+  Run the hook by hand to see the API's reply:
+    CERTBOT_DOMAIN=$APEX CERTBOT_VALIDATION=test $HOOKF auth
+  Let's Encrypt allows 5 identical certificates per week; if that is the limit
+  you hit, issue on one host and import here with --cert-bundle."
+  grn "  certificate: wildcard issued for $CERTWANT"
 else
   if [ -z "${EMAIL:-}" ] && can_ask; then
     ask "E-mail for expiry notices (optional, press Enter to skip)" EMAIL ".*" "-" || true
@@ -836,13 +1036,12 @@ else
             --register-unsafely-without-email >/dev/null 2>&1 || true
   fi
   docker start remnawave-nginx >/dev/null 2>&1 || true
-  cert_ok "$DOMAIN" || die "could not obtain a certificate for $DOMAIN.
+  cert_ok "$CERTNAME" "$CERTWANT" || die "could not obtain a certificate for $DOMAIN.
   Check that the domain resolves to this host and that port 80 is reachable.
   Let's Encrypt allows 5 certificates per exact domain per week - if that limit
   was hit, the only option is to wait."
   grn "  certificate: issued for $DOMAIN"
 fi
-
 # ---------- 5. recreate containers and verify ----------
 cd "$DIR"
 docker compose pull >/dev/null 2>&1 || true
@@ -869,31 +1068,47 @@ else
   red "  nginx: container still sees the OLD config (inode-bound mount)"
 fi
 
-# ---------- 5b. certificate renewal: standalone -> webroot ----------
-# nginx now holds :80, so certbot --standalone would fail on renewal.
-# Switch to webroot and verify with a dry run; revert if it fails.
-RCONF="/etc/letsencrypt/renewal/${DOMAIN}.conf"
-if [ -f "$RCONF" ] && command -v certbot >/dev/null; then
-  if grep -q '^authenticator[[:space:]]*=[[:space:]]*standalone' "$RCONF"; then
-    cp "$RCONF" "${RCONF}.bak-$STAMP"
-    sed -i -E 's|^authenticator[[:space:]]*=.*|authenticator = webroot|' "$RCONF"
-    grep -q '^webroot_path' "$RCONF" && sed -i -E 's|^webroot_path[[:space:]]*=.*|webroot_path = /var/www/html,|' "$RCONF"                                      || sed -i -E '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RCONF"
-    if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
-      grn "  certificate: renewal switched to webroot, dry run passed"
-    else
-      cp "${RCONF}.bak-$STAMP" "$RCONF"
-      red "  certificate: webroot failed, reverted to standalone."
-      red "              Renewal now conflicts with nginx on :80 - fix this manually!"
-    fi
+# ---------- 5b. certificate renewal ----------
+# http mode leaves certbot set to --standalone, which wants :80 that nginx now
+# holds, so renewal is converted to webroot and proved with a dry run.
+# dns mode renews through the Gcore hook and needs neither.
+RCONF="/etc/letsencrypt/renewal/${CERTNAME}.conf"
+if [ ! -f "$RCONF" ]; then
+  if [ -n "${CERT_BUNDLE:-}" ] || [ "$CERT_MODE" = "dns" ]; then
+    ylw "  certificate: no renewal config here - this node runs on an imported bundle."
+    ylw "              Renew on the issuing host and import again before it expires."
   else
-    if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
-      grn "  certificate: renewal works"
-    else
-      ylw "  certificate: renewal dry run failed - check 'certbot renew --dry-run'"
-    fi
+    ylw "  certificate: renewal config not found, renewal not verified"
+  fi
+elif ! command -v certbot >/dev/null; then
+  ylw "  certificate: certbot not found, renewal not verified"
+elif grep -q '^authenticator[[:space:]]*=[[:space:]]*manual' "$RCONF"; then
+  # A dry run here would drive two real challenges through the Gcore API and
+  # wait on public DNS for both, which is minutes on every single run. Check
+  # that the parts renewal depends on are present instead.
+  if [ -s "$DIR/.gcore-token" ] && [ -x "$HOOKF" ]; then
+    grn "  certificate: DNS-01 renewal configured (hook and token in place)"
+  else
+    red "  certificate: DNS-01 renewal will fail - hook or token missing under $DIR"
+    red "              Re-run with --gcore-token to restore them."
+  fi
+elif grep -q '^authenticator[[:space:]]*=[[:space:]]*standalone' "$RCONF"; then
+  cp "$RCONF" "${RCONF}.bak-$STAMP"
+  sed -i -E 's|^authenticator[[:space:]]*=.*|authenticator = webroot|' "$RCONF"
+  grep -q '^webroot_path' "$RCONF" && sed -i -E 's|^webroot_path[[:space:]]*=.*|webroot_path = /var/www/html,|' "$RCONF" || sed -i -E '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RCONF"
+  if certbot renew --cert-name "$CERTNAME" --dry-run >/dev/null 2>&1; then
+    grn "  certificate: renewal switched to webroot, dry run passed"
+  else
+    cp "${RCONF}.bak-$STAMP" "$RCONF"
+    red "  certificate: webroot failed, reverted to standalone."
+    red "              Renewal now conflicts with nginx on :80 - fix this manually!"
   fi
 else
-  ylw "  certificate: renewal config or certbot not found, renewal not verified"
+  if certbot renew --cert-name "$CERTNAME" --dry-run >/dev/null 2>&1; then
+    grn "  certificate: renewal works"
+  else
+    ylw "  certificate: renewal dry run failed - check 'certbot renew --dry-run'"
+  fi
 fi
 
 # ---------- 6. keys and panel values ----------
@@ -910,8 +1125,8 @@ SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 FF=$(( 140 + $(hb 41) % 15 ))
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${FF}.0) Gecko/20100101 Firefox/${FF}.0"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-CERTF="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-KEYF="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+CERTF="/etc/letsencrypt/live/$CERTNAME/fullchain.pem"
+KEYF="/etc/letsencrypt/live/$CERTNAME/privkey.pem"
 OUT="/root/${DOMAIN}-panel.txt"
 
 {

@@ -6,6 +6,8 @@ itself; on an existing one it brings the node up to the same state.
 ```bash
 bash node-setup.sh [domain] [--secret-key <key>] [--email <addr>] [--panel-ip <IP>]
                             [--force-cert | --keep-certs] [--new-site] [--brand <name>]
+                            [--cert-mode http|dns] [--gcore-token <t>] [--apex <zone>]
+                            [--cert-bundle <file>]
 ```
 
 Anything not supplied on the command line is asked for interactively, so the usual
@@ -27,6 +29,7 @@ rr                    # menu
 rr node.example.com   # set up or reconfigure
 rr check              # health check, read-only
 rr panel              # print the saved panel values again
+rr cert-export        # pack the certificate for the other nodes
 ```
 
 It re-downloads the current version rather than copying itself, and syntax-checks the
@@ -83,7 +86,8 @@ a newer release is verified.
 5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.
-6. **Handles the certificate** — see below.
+6. **Handles the certificate** — per-node, or one wildcard for the whole fleet so
+   node hostnames stay out of the Certificate Transparency logs. See below.
 7. **Generates keys** and writes a ready-to-paste config profile plus host values to
    `/root/<domain>-panel.txt`.
 
@@ -118,28 +122,68 @@ listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
 
 ## Certificate
 
-The script issues the certificate itself, so a node can be pointed at a new domain in
-a single run. Order of operations:
+Two ways to get one, and the choice is about Certificate Transparency rather than
+convenience.
 
-- certificates belonging to **other** domains are deleted first. A node serves exactly
-  one domain, and leftovers from a previous one only get in the way. `--keep-certs`
-  skips this.
-- if a valid certificate for the target domain is already present — more than seven days
-  of life left and a matching SAN — it is **reused**. Reissuing for its own sake burns
-  quota.
-- otherwise one is issued with `certbot --standalone`. The nginx container is stopped for
-  the duration, since that method needs port 80 to itself.
+### `--cert-mode http` (default)
 
-`--force-cert` drops the current certificate and issues a new one. Use it when the
-existing certificate is broken, not merely old.
+`certbot --standalone`, one certificate per node, named after the node. Nothing to
+configure and nothing to distribute.
 
-Let's Encrypt allows **five certificates per exact domain per week**. Forcing a reissue
-repeatedly on the same domain will hit that ceiling, and the only remedy is to wait it
-out — which is precisely why the default path reuses a valid certificate rather than
-replacing it.
+The cost is that **every issuance publishes the node's hostname**. CT logs are public
+and permanent, so one query for `%.example.com` on crt.sh returns the fleet — every
+node, plus whatever else lives under that apex — without a single packet sent to any
+of them. Per-node masquerade sites do not help against this; there is nothing to
+correlate when the list is handed over on request.
 
-Registration falls back to `--register-unsafely-without-email` unless `--email` is given.
-Without an address there are no expiry reminders, which matters little here because
+### `--cert-mode dns`
+
+One wildcard for `*.<apex>`, shared by every node. CT then shows the wildcard and
+nothing else, and node hostnames stop being enumerable.
+
+Validation is DNS-01 through the Gcore API, so the apex zone has to be hosted there.
+The token comes from `--gcore-token` or `GCORE_API_TOKEN` and is stored in
+`/opt/remnanode/.gcore-token` — renewal runs from a systemd timer that carries none
+of the invoking shell's environment, so a token that only ever lived in a variable
+would work once and fail sixty days later.
+
+The apex is guessed by dropping the first label. Pass `--apex` when that guess cannot
+work, such as under a multi-part public suffix.
+
+### One issues, the rest import
+
+Let's Encrypt allows **five identical certificates per week**, which is fewer than a
+fleet of any size, so the nodes cannot each request the same wildcard. Issue once:
+
+```bash
+rr node-a.example.com --cert-mode dns --gcore-token <token>
+rr cert-export
+```
+
+Copy the bundle to each remaining node and install it there:
+
+```bash
+rr node-b.example.com --cert-mode dns --cert-bundle /root/example.com-cert.tgz
+```
+
+An imported bundle carries no renewal configuration, so certbot leaves it alone and
+nothing on that node will try to renew it. Renewal stays on the issuing host; export
+and import again before expiry. The script says so on every run rather than letting
+it be a surprise.
+
+### Reuse, force, and the rate limit
+
+A certificate already present with more than seven days of life and a matching name is
+reused; reissuing for its own sake burns quota. `--force-cert` drops it and issues a
+new one — for a broken certificate, not merely an old one. Certificates belonging to
+other domains are deleted first, since a node serves exactly one; `--keep-certs` skips
+that.
+
+Hitting the five-per-week ceiling has no remedy but waiting, which is the reason the
+default path reuses rather than replaces.
+
+Registration falls back to `--register-unsafely-without-email` unless `--email` is
+given. Without an address there are no expiry reminders, which matters little while
 renewal is automated and verified on every run.
 
 ## Panel IP
@@ -150,11 +194,16 @@ yields an address, the script asks for it.
 
 ## Certificate renewal
 
-nginx takes `:80`, while the installer usually configures renewal through
-`certbot --standalone`, which needs that port exclusively. The script converts renewal
-to `webroot` and verifies it with `certbot renew --dry-run`. If the check fails it
-reverts to `standalone` and prints a warning — a silent failure here would only surface
-when the certificate expires.
+In `http` mode nginx takes `:80` while the installer usually configures renewal through
+`certbot --standalone`, which needs that port exclusively. The script converts renewal to
+`webroot` and verifies it with `certbot renew --dry-run`. If the check fails it reverts to
+`standalone` and prints a warning — a silent failure here would only surface when the
+certificate expires.
+
+In `dns` mode nothing competes for `:80`. A dry run is deliberately **not** performed:
+it would drive two live challenges through the Gcore API and wait on public DNS for
+both, on every run. The script checks that the hook and the token are in place instead,
+which is what renewal actually depends on.
 
 ## Re-runs and rollback
 

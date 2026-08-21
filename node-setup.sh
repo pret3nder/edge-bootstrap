@@ -242,6 +242,9 @@ menu() {
 
 RE_DOMAIN='^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
 RE_IP='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+# These go to grep -E. BRE interval syntax (\{8,\}) reads as a literal brace
+# there and matches nothing, which rejects every value the user types.
+RE_TOKEN='^[^[:space:]]{16,}$'
 
 # ---------------------------------------------------------------------------
 # Bare-metal install. Everything the node needs, so a fresh server goes from
@@ -457,7 +460,7 @@ fi
 # have been rewritten, and stopping to prompt in the middle of that is worse
 # than failing before anything was touched.
 if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && can_ask; then
-  ask "  Gcore API token" GCORE_TOKEN '.\{8,\}' || true
+  ask "  Gcore API token" GCORE_TOKEN "$RE_TOKEN" || true
 fi
 # Which certificate this node runs on, and which name it has to contain.
 # http: one per node, named after the node. dns: one wildcard for the apex,
@@ -1035,7 +1038,7 @@ if [ -n "${CERT_BUNDLE:-}" ]; then
 elif cert_ok "$CERTNAME" "$CERTWANT"; then
   grn "  certificate: existing one is valid, reusing it"
 elif [ "$CERT_MODE" = "dns" ]; then
-  [ -n "${GCORE_TOKEN:-}" ] || { can_ask && ask "Gcore API token (DNS-01 validation)" GCORE_TOKEN '.\{8,\}'; }
+  [ -n "${GCORE_TOKEN:-}" ] || { can_ask && ask "Gcore API token (DNS-01 validation)" GCORE_TOKEN "$RE_TOKEN"; }
   [ -n "${GCORE_TOKEN:-}" ] || die "--cert-mode dns needs a Gcore API token (--gcore-token, GCORE_API_TOKEN,
   or an existing /opt/remnanode/.gcore-token). Alternatively issue the wildcard on
   one host and bring it here with --cert-bundle."

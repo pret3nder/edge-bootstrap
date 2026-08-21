@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # node-setup.sh - post-install setup for a Remnawave node. Run after the stock installer.
 #
-#   bash node-setup.sh <domain> [--panel-ip <IP>]
+#   bash node-setup.sh <domain> [options]
+#
+# Options:
+#   --panel-ip <IP>   panel address for the NODE_PORT rule (auto-detected by default)
+#   --email <addr>    e-mail for the Let's Encrypt account (first registration only)
+#   --force-cert      drop the current certificate and issue a fresh one
+#   --keep-certs      keep certificates belonging to other domains
 #
 # The panel IP is read from the existing ufw rule on NODE_PORT.
 # If there is no such rule, pass PANEL_IP=<IP> or --panel-ip <IP>.
@@ -12,7 +18,8 @@
 #   3. writes a hardened nginx config (server_tokens off, probe-404, SPA fallback, access_log off)
 #   4. installs a small static site, deterministically different per domain
 #   5. firewall: only 80 and 443 tcp+udp exposed; NODE_PORT restricted to the panel IP
-#   6. generates keys and writes a ready-to-paste config profile and host values to a file
+#   6. issues the certificate if missing and clears ones left from a previous domain
+#   7. generates keys and writes a ready-to-paste config profile and host values to a file
 #
 # Inbounds: XHTTP-REALITY (443/tcp) and Hysteria2 (443/udp).
 # VLESS-PQ and HTTPUpgrade are intentionally omitted: extra listening ports add no value here.
@@ -32,7 +39,10 @@ DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
 while [ $# -gt 0 ]; do
   case "$1" in
-    --panel-ip) shift; PANEL_IP="${1:-}" ;;
+    --panel-ip)   shift; PANEL_IP="${1:-}" ;;
+    --email)      shift; EMAIL="${1:-}" ;;
+    --force-cert) FORCE_CERT=1 ;;
+    --keep-certs) KEEP_CERTS=1 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -56,7 +66,7 @@ detect_panel_ip() {
 [ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
 [ -f "$DIR/docker-compose.yml" ] || die "missing $DIR/docker-compose.yml"
 command -v docker >/dev/null || die "docker is not installed"
-[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] || die "no certificate for $DOMAIN"
+command -v certbot >/dev/null || die "certbot is not installed"
 
 detect_panel_ip || die "could not determine the panel IP.
   Via env:  PANEL_IP=1.2.3.4 bash node-setup.sh $DOMAIN
@@ -225,6 +235,50 @@ if command -v ufw >/dev/null; then
   grn "  firewall: 80, 443 tcp+udp; 2222 restricted to $PANEL_IP"
 else
   ylw "  ufw not found - open the ports manually"
+fi
+
+# ---------- 4b. certificate ----------
+# Runs after the firewall opened :80 and before nginx is (re)started, because
+# certbot --standalone needs that port to itself.
+
+cert_ok() {
+  local d="$1" f="/etc/letsencrypt/live/$1/fullchain.pem"
+  [ -f "$f" ] || return 1
+  openssl x509 -in "$f" -noout -checkend 604800 >/dev/null 2>&1 || return 1   # >7 days left
+  openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q "DNS:$d" || return 1
+}
+
+# Certificates left over from a previous domain: this node serves exactly one.
+if [ "${KEEP_CERTS:-0}" != "1" ]; then
+  for c in $(certbot certificates 2>/dev/null | sed -n 's/^[[:space:]]*Certificate Name:[[:space:]]*//p'); do
+    [ "$c" = "$DOMAIN" ] && continue
+    ylw "  certificate: removing stale cert for $c"
+    certbot delete --cert-name "$c" --non-interactive >/dev/null 2>&1 || true
+  done
+fi
+
+if [ "${FORCE_CERT:-0}" = "1" ] && [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+  ylw "  certificate: --force-cert given, dropping the existing one"
+  certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
+fi
+
+if cert_ok "$DOMAIN"; then
+  grn "  certificate: existing one is valid, reusing it"
+else
+  docker stop remnawave-nginx >/dev/null 2>&1 || true
+  if [ -n "${EMAIL:-}" ]; then
+    certbot certonly --standalone -d "$DOMAIN" --agree-tos --non-interactive \
+            -m "$EMAIL" >/dev/null 2>&1 || true
+  else
+    certbot certonly --standalone -d "$DOMAIN" --agree-tos --non-interactive \
+            --register-unsafely-without-email >/dev/null 2>&1 || true
+  fi
+  docker start remnawave-nginx >/dev/null 2>&1 || true
+  cert_ok "$DOMAIN" || die "could not obtain a certificate for $DOMAIN.
+  Check that the domain resolves to this host and that port 80 is reachable.
+  Let's Encrypt allows 5 certificates per exact domain per week - if that limit
+  was hit, the only option is to wait."
+  grn "  certificate: issued for $DOMAIN"
 fi
 
 # ---------- 5. recreate containers and verify ----------

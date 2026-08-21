@@ -4,7 +4,7 @@ Post-install setup for a Remnawave node. Run it **after** the stock installer �
 it does not replace it.
 
 ```bash
-bash node-setup.sh <domain> [--panel-ip <IP>]
+bash node-setup.sh <domain> [--email <addr>] [--force-cert] [--keep-certs] [--panel-ip <IP>]
 ```
 
 ## Why
@@ -29,7 +29,8 @@ This script closes all of that in one pass.
 5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.
-6. **Generates keys** and writes a ready-to-paste config profile plus host values to
+6. **Handles the certificate** — see below.
+7. **Generates keys** and writes a ready-to-paste config profile plus host values to
    `/root/<domain>-panel.txt`.
 
 ## Inbounds
@@ -41,6 +42,32 @@ node, and PQ on a secondary port served a byte-identical site and certificate to
 the same content on two ports is an odd thing to expose. With those gone the node
 listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
 443/tcp serves the site, 443/udp answers nothing unless it recognises the traffic.
+
+## Certificate
+
+The script issues the certificate itself, so a node can be pointed at a new domain in
+a single run. Order of operations:
+
+- certificates belonging to **other** domains are deleted first. A node serves exactly
+  one domain, and leftovers from a previous one only get in the way. `--keep-certs`
+  skips this.
+- if a valid certificate for the target domain is already present — more than seven days
+  of life left and a matching SAN — it is **reused**. Reissuing for its own sake burns
+  quota.
+- otherwise one is issued with `certbot --standalone`. The nginx container is stopped for
+  the duration, since that method needs port 80 to itself.
+
+`--force-cert` drops the current certificate and issues a new one. Use it when the
+existing certificate is broken, not merely old.
+
+Let's Encrypt allows **five certificates per exact domain per week**. Forcing a reissue
+repeatedly on the same domain will hit that ceiling, and the only remedy is to wait it
+out — which is precisely why the default path reuses a valid certificate rather than
+replacing it.
+
+Registration falls back to `--register-unsafely-without-email` unless `--email` is given.
+Without an address there are no expiry reminders, which matters little here because
+renewal is automated and verified on every run.
 
 ## Panel IP
 
@@ -62,10 +89,12 @@ Safe to re-run. Backups are written before anything is overwritten:
 `docker-compose.yml.bak-<date>`, `nginx.conf.bak-<date>`, `<domain>.conf.bak-<date>`.
 
 ⚠️ Keys are regenerated on every run. On a node that already has clients this will
-disconnect them — the script is meant for initial setup. When moving an existing node
-to a new host, reuse the keys from the panel instead.
+disconnect them — the script is meant for initial setup or for repointing a node at a
+new domain. When moving an existing node to a new host while keeping its clients, reuse
+the keys from the panel instead.
 
 ## Requirements
 
-Ubuntu or Debian, root, docker with compose v2, a certificate already issued for the
-domain, and a node installed in `/opt/remnanode`.
+Ubuntu or Debian, root, docker with compose v2, certbot, and a node installed in
+`/opt/remnanode`. The domain must already resolve to the host, and port 80 must be
+reachable from the internet for issuance to succeed.

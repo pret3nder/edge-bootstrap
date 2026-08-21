@@ -87,7 +87,31 @@ else
 fi
 [ -s "$T/opt/remnanode/nginx.conf" ] && echo "  ✓ nginx.conf создан" || { echo "  ⚠ нет nginx.conf"; fail=1; }
 [ -s "$T/var/www/html/index.html" ] && echo "  ✓ заглушка создана" || { echo "  ⚠ нет заглушки"; fail=1; }
-[ -s "$T/root/$TEST_DOMAIN-panel.txt" ] && echo "  ✓ данные для панели записаны" || { echo "  ⚠ нет данных для панели"; fail=1; }
+P="$T/root/$TEST_DOMAIN-panel.txt"
+if [ -s "$P" ]; then
+  echo "  ✓ данные для панели записаны"
+  # User-Agent для XHTTP - это КЛЮЧЕВОЕ СЛОВО Xray, а не строка заголовка.
+  # Ядро знает chrome/firefox/safari/edge/curl/golang и разворачивает каждое
+  # в полный набор (sec-ch-ua, Accept, sec-fetch-*). Литерал "Mozilla/5.0 ..."
+  # не подходит ни под один case - сопутствующие заголовки не ставятся вовсе.
+  # Скрипт однажды генерировал именно литерал; это регрессия, а не мелочь.
+  ua=$(grep -oE '"User-Agent": "[^"]*"' "$P" | head -1 | sed 's/.*: "//; s/"$//')
+  fp=$(grep -oE '"fingerprint": "[^"]*"' "$P" | head -1 | sed 's/.*: "//; s/"$//')
+  case "$ua" in
+    chrome|firefox|safari|edge) echo "  ✓ User-Agent - ключевое слово: $ua" ;;
+    Mozilla*) echo "  ⚠ User-Agent - ЛИТЕРАЛ ($(printf '%.40s' "$ua")...) - Xray его не развернёт"; fail=1 ;;
+    *)        echo "  ⚠ User-Agent непонятного вида: '$ua'"; fail=1 ;;
+  esac
+  if [ -n "$fp" ] && [ "$fp" = "$ua" ]; then
+    echo "  ✓ fingerprint совпадает с User-Agent: $fp"
+  else
+    echo "  ⚠ fingerprint='$fp' против User-Agent='$ua' - uTLS и заголовки разойдутся"; fail=1
+  fi
+  grep -q "Fingerprint: $fp" "$P" && echo "  ✓ в инструкции по Host тот же fingerprint" \
+    || { echo "  ⚠ в инструкции по Host fingerprint другой"; fail=1; }
+else
+  echo "  ⚠ нет данных для панели"; fail=1
+fi
 
 echo
 [ "$fail" = "0" ] && echo "ВСЕ ПРОВЕРКИ ПРОШЛИ" || echo "ЕСТЬ ПРОБЛЕМЫ"

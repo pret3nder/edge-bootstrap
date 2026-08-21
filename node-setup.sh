@@ -182,7 +182,19 @@ cmd_check() {
 
   # --- site -----------------------------------------------------------------
   if [ -s /var/www/html/index.html ]; then
-    grn "  static site: present ($(grep -m1 -oE '<title>[^<]*' /var/www/html/index.html 2>/dev/null | sed 's/<title>//' || echo untitled))"
+    # The stock installer leaves a Vite shell titled Page_<8 hex>, with a
+    # config-id meta and a hex HTML comment. Only those hex tokens vary, so
+    # every node running it serves the same structure - and it ships with a
+    # public installer, which makes it a signature anyone can grep the internet
+    # for. Present here means this node was never re-done with this script.
+    if grep -qE '<title>Page_[0-9a-f]{8}</title>' /var/www/html/index.html 2>/dev/null; then
+      red "  static site: still the stock installer's placeholder (title Page_xxxxxxxx)"
+      red "              Same structure on every node that has it, from a public template."
+      red "              Re-run setup on this node to replace it."
+      fails=$((fails + 1))
+    else
+      grn "  static site: present ($(grep -m1 -oE '<title>[^<]*' /var/www/html/index.html 2>/dev/null | sed 's/<title>//' || echo untitled))"
+    fi
   else
     red "  static site: missing - the SPA fallback will loop and return 500 on everything"
     fails=$((fails + 1))
@@ -450,18 +462,6 @@ if [ "$CERT_MODE_SET" = "0" ] && can_ask; then
   ask "  choice" CERT_CHOICE '^[12]$' 1 || CERT_CHOICE=1
   [ "$CERT_CHOICE" = "2" ] && CERT_MODE=dns
 fi
-
-# Re-runs should not need the token pasted again.
-if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && [ -s "$DIR/.gcore-token" ]; then
-  GCORE_TOKEN=$(cat "$DIR/.gcore-token")
-  grn "  certificate: reusing the Gcore token already stored on this host"
-fi
-# Asked here rather than at issuing time: by then compose, nginx and the site
-# have been rewritten, and stopping to prompt in the middle of that is worse
-# than failing before anything was touched.
-if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && can_ask; then
-  ask "  Gcore API token" GCORE_TOKEN "$RE_TOKEN" || true
-fi
 # Which certificate this node runs on, and which name it has to contain.
 # http: one per node, named after the node. dns: one wildcard for the apex,
 # shared by the fleet. Everything downstream - the compose mounts, the nginx
@@ -481,6 +481,41 @@ case "$CERT_MODE" in
   *)
     die "unknown --cert-mode: $CERT_MODE (expected http or dns)" ;;
 esac
+
+# Issue or import. One wildcard serves the whole fleet, and Let's Encrypt allows
+# five identical certificates per week, so a node that issues its own instead of
+# importing burns a slot the fleet cannot spare. Nothing here can see the other
+# nodes, so the choice is put to the operator rather than guessed - and the
+# import is what the default lands on.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${CERT_BUNDLE:-}" ] \
+   && [ ! -f "/etc/letsencrypt/live/$CERTNAME/fullchain.pem" ] && can_ask; then
+  printf '\n\033[33m  Wildcard for *.%s\033[0m\n' "$APEX" >/dev/tty
+  printf '    This node has no certificate yet. Two ways to get one:\n' >/dev/tty
+  printf '    1) import the bundle another node already issued   (recommended)\n' >/dev/tty
+  printf '       Make it there with:  rr cert-export\n' >/dev/tty
+  printf '    2) issue a new wildcard from Let%s Encrypt now\n' "'s" >/dev/tty
+  printf '       Costs one of five per week for the whole fleet, shared by every node.\n' >/dev/tty
+  printf '       Correct for the first node, and wasteful for the rest.\n' >/dev/tty
+  CERT_SRC=1
+  ask "  choice" CERT_SRC '^[12]$' 1 || CERT_SRC=1
+  if [ "$CERT_SRC" = "1" ]; then
+    ask "  path to the bundle" CERT_BUNDLE '^/.+' || true
+    [ -n "${CERT_BUNDLE:-}" ] || die "no bundle given. Run 'rr cert-export' on the node that
+  already holds the wildcard, copy the file here, and pass --cert-bundle <path>."
+  fi
+fi
+
+# Re-runs should not need the token pasted again.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && [ -s "$DIR/.gcore-token" ]; then
+  GCORE_TOKEN=$(cat "$DIR/.gcore-token")
+  grn "  certificate: reusing the Gcore token already stored on this host"
+fi
+# Asked here rather than at issuing time: by then compose, nginx and the site
+# have been rewritten, and stopping to prompt in the middle of that is worse
+# than failing before anything was touched.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && can_ask; then
+  ask "  Gcore API token" GCORE_TOKEN "$RE_TOKEN" || true
+fi
 
 # Domain is known now, so the compose file can name the right certificate paths.
 [ "$NEED_INSTALL" = "1" ] && install_node
@@ -1158,8 +1193,21 @@ PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static
 XPATH="${PATHS[$(( $(hb 40) % ${#PATHS[@]} ))]}"
 SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
-FF=$(( 140 + $(hb 41) % 15 ))
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${FF}.0) Gecko/20100101 Firefox/${FF}.0"
+# The User-Agent Xray wants here is a KEYWORD, not a header value. The core
+# knows chrome, firefox, safari, edge, curl and golang, and expands each into a
+# full matching set - the real UA plus sec-ch-ua, Accept, Accept-Language and
+# sec-fetch-* (common/utils/browser.go, TryDefaultHeadersWith). A hand-written
+# "Mozilla/5.0 ..." string matches no case, so none of the companion headers are
+# set at all and the request resembles a browser in exactly one field out of
+# seven. The literal is worse than the short word, not better.
+#
+# It also has to equal the REALITY fingerprint, or uTLS presents itself as one
+# browser while the headers claim another. Both read from FP for that reason.
+# Only these four are valid on both sides, and the seed picks one so the fleet
+# is not uniform while a given node stays stable across re-runs.
+FPS=(chrome firefox safari edge)
+FP="${FPS[$(( $(hb 41) % 4 ))]}"
+UA="$FP"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$CERTNAME/fullchain.pem"
 KEYF="/etc/letsencrypt/live/$CERTNAME/privkey.pem"
@@ -1192,7 +1240,7 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '        },'
   echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
   echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"],"
-  echo '          "fingerprint": "firefox", "spiderX": "/" }'
+  echo "          \"fingerprint\": \"$FP\", \"spiderX\": \"/\" }"
   echo '      }'
   echo '    },'
   echo '    {'
@@ -1221,7 +1269,7 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "Inbound    : XHTTP-REALITY-$SUF"
   echo "Address    : $DOMAIN / 443"
   echo "SNI        : $DOMAIN"
-  echo "Fingerprint: firefox"
+  echo "Fingerprint: $FP        <- must match the User-Agent keyword below"
   echo "Path/ALPN  : leave empty (taken from the inbound)"
   echo "xHTTP button:"
   echo "{ \"xmux\": { \"maxConnections\": \"2\", \"cMaxReuseTimes\": \"128-256\", \"hKeepAlivePeriod\": 45,"

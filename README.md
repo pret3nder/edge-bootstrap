@@ -94,7 +94,10 @@ a newer release is verified.
 6. **Handles the certificate** — per-node, or one wildcard for the whole fleet so
    node hostnames stay out of the Certificate Transparency logs. See below.
 7. **Generates keys** and writes a ready-to-paste config profile plus host values to
-   `/root/<domain>-panel.txt`.
+   `/root/<domain>-panel.txt`. The XHTTP `User-Agent` is emitted as an Xray keyword
+   (`chrome`/`firefox`/`safari`/`edge`), which the core expands into a full matching
+   header set, and it is read from the same variable as the REALITY fingerprint so the
+   two cannot disagree.
 
 ## Masquerade site
 
@@ -160,6 +163,12 @@ The apex is guessed by dropping the first label. Pass `--apex` when that guess c
 work, such as under a multi-part public suffix.
 
 ### One issues, the rest import
+
+When a node has no certificate yet and nothing was passed on the command line, setup
+asks which of the two it should do, and the default is import. Issuing is correct for
+the first node and wasteful for every other one, and nothing on a node can see whether
+another already holds the wildcard — so the question goes to the operator instead of
+being guessed.
 
 Let's Encrypt allows **five identical certificates per week**, which is fewer than a
 fleet of any size, so the nodes cannot each request the same wildcard. Issue once:

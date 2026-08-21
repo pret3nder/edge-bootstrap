@@ -210,9 +210,13 @@ done
 grn "  nginx: hardened config written"
 
 # ---------- 3. static site ----------
+# The page has to differ per node: one identical document served from a dozen
+# addresses is itself something to correlate on. Brand, accent colour and layout
+# are all derived from the domain hash, so a node regenerates the same site every
+# time while no two nodes share one.
 mkdir -p /var/www/html
-H=$(printf '%s' "$DOMAIN" | md5sum | tr -dc '0-9' | cut -c1-6)
-[ -z "$H" ] && H=1
+H=$(printf '%s' "$DOMAIN" | md5sum | tr -dc '0-9' | cut -c1-9)
+[ -z "$H" ] && H=123456789
 BRANDS=("Northwind|Infrastructure notes and tooling|#3b6ea5"
         "Kestrel|Small tools, done properly|#2f7a5b"
         "Basalt|Systems engineering studio|#8a4b2a"
@@ -220,13 +224,25 @@ BRANDS=("Northwind|Infrastructure notes and tooling|#3b6ea5"
         "Tessera|Data plumbing for small teams|#2b6b7a"
         "Halcyon|Software, unhurried|#2b5a7a"
         "Ridgeway|Practical automation|#7a5a2b"
-        "Lumen|Interfaces and prototypes|#7a3f5a")
-IDX=$(( 10#$H % ${#BRANDS[@]} ))
+        "Lumen|Interfaces and prototypes|#7a3f5a"
+        "Alder|Scheduling for background work|#4a4a6b"
+        "Wren|Field notes on small systems|#3f6b6b"
+        "Marlowe|Backend consulting|#6b3f4a"
+        "Foundry|Build and release tooling|#556b2f"
+        "Cairn|Monitoring without the noise|#2f5b6b"
+        "Thicket|Data pipelines, plainly|#6b5a3f"
+        "Beacon|Status pages and alerting|#3f4a7a"
+        "Quarry|Storage and archival|#6b6b2b")
+IDX=$(( 10#${H:0:6} % ${#BRANDS[@]} ))
+LAYOUT=$(( 10#${H:6:2} % 4 ))
 BN="${BRANDS[$IDX]%%|*}"
 REST="${BRANDS[$IDX]#*|}"
 BT="${REST%%|*}"
 BC="${REST#*|}"
-YEAR=$(( 2016 + 10#$H % 8 ))
+YEAR=$(( 2015 + 10#${H:0:2} % 10 ))
+NPOST=$(( 20 + 10#${H:2:2} % 80 ))
+NPROJ=$(( 10 + 10#${H:4:2} % 60 ))
+
 {
   echo '<!doctype html><html lang="en"><head><meta charset="utf-8">'
   echo '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -253,25 +269,80 @@ YEAR=$(( 2016 + 10#$H % 8 ))
   echo 'footer{padding:36px 0;color:var(--m);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}'
   echo '@media(max-width:640px){.h h1{font-size:29px}nav ul{display:none}}'
   echo '</style></head><body>'
-  echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>.</span></div>"
-  echo '<nav><ul><li><a href="/work">Work</a></li><li><a href="/notes">Notes</a></li><li><a href="/about">About</a></li></ul></nav></div></header>'
-  echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
-  echo '<p>We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.</p>'
-  echo '<a class="btn" href="/work">See recent work</a></div></section>'
-  echo '<div class="w"><div class="g">'
-  echo '<div class="c"><h3>Internal tooling</h3><p>Dashboards, admin panels and job runners that teams keep using after launch.</p></div>'
-  echo '<div class="c"><h3>Data plumbing</h3><p>Ingest, transform, schedule. Boring on purpose, observable by default.</p></div>'
-  echo '<div class="c"><h3>Maintenance</h3><p>Long-term care for systems that outlived the team that wrote them.</p></div>'
-  echo '</div></div>'
-  echo '<div class="st"><div class="w">'
-  echo "<div class=\"s\"><b>$YEAR</b><span>Working since</span></div>"
-  echo '<div class="s"><b>40+</b><span>Projects shipped</span></div>'
-  echo '<div class="s"><b>6</b><span>People</span></div>'
-  echo '</div></div>'
-  echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/privacy\">Privacy</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>"
+
+  case "$LAYOUT" in
+    0)  # studio / agency
+      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>.</span></div>"
+      echo '<nav><ul><li><a href="/work">Work</a></li><li><a href="/notes">Notes</a></li><li><a href="/about">About</a></li></ul></nav></div></header>'
+      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
+      echo '<p>We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.</p>'
+      echo '<a class="btn" href="/work">See recent work</a></div></section>'
+      echo '<div class="w"><div class="g">'
+      echo '<div class="c"><h3>Internal tooling</h3><p>Dashboards, admin panels and job runners that teams keep using after launch.</p></div>'
+      echo '<div class="c"><h3>Data plumbing</h3><p>Ingest, transform, schedule. Boring on purpose, observable by default.</p></div>'
+      echo '<div class="c"><h3>Maintenance</h3><p>Long-term care for systems that outlived the team that wrote them.</p></div>'
+      echo '</div></div>'
+      echo '<div class="st"><div class="w">'
+      echo "<div class=\"s\"><b>$YEAR</b><span>Working since</span></div>"
+      echo "<div class=\"s\"><b>$NPROJ</b><span>Projects shipped</span></div>"
+      echo '<div class="s"><b>6</b><span>People</span></div>'
+      echo '</div></div>'
+      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/privacy\">Privacy</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
+    1)  # small SaaS / API
+      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>/</span>api</div>"
+      echo '<nav><ul><li><a href="/docs">Docs</a></li><li><a href="/pricing">Pricing</a></li><li><a href="/changelog">Changelog</a></li></ul></nav></div></header>'
+      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
+      echo '<p>A small HTTP API for queueing and running deferred jobs. No agents, no sidecars &mdash; one endpoint and a token.</p>'
+      echo '<a class="btn" href="/docs">Read the docs</a></div></section>'
+      echo '<div class="w"><div class="g">'
+      echo '<div class="c"><h3>Simple by design</h3><p>One POST creates a job. One GET tells you how it went. That is the whole surface.</p></div>'
+      echo '<div class="c"><h3>Retries built in</h3><p>Exponential backoff, dead-letter queue, idempotency keys. Nothing to configure.</p></div>'
+      echo '<div class="c"><h3>Observable</h3><p>Structured logs and per-job timing out of the box.</p></div>'
+      echo '</div></div>'
+      echo '<div class="st"><div class="w">'
+      echo "<div class=\"s\"><b>v2.$(( 10#${H:0:1} ))</b><span>Current release</span></div>"
+      echo '<div class="s"><b>99.9%</b><span>Target uptime</span></div>'
+      echo "<div class=\"s\"><b>&lt;$(( 60 + 10#${H:1:2} % 40 ))ms</b><span>Median enqueue</span></div>"
+      echo '</div></div>'
+      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/status\">Status</a> &middot; <a href=\"/terms\">Terms</a></div></footer></div>" ;;
+    2)  # engineering notes / blog
+      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>.</span></div>"
+      echo '<nav><ul><li><a href="/archive">Archive</a></li><li><a href="/tags">Tags</a></li><li><a href="/about">About</a></li></ul></nav></div></header>'
+      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
+      echo '<p>Occasional write-ups about builds, failures and the things that only break in production.</p>'
+      echo '<a class="btn" href="/archive">Browse the archive</a></div></section>'
+      echo '<div class="w"><div class="g">'
+      echo '<div class="c"><h3>Rewriting the scheduler</h3><p>Why we dropped the queue library and wrote 200 lines instead.</p></div>'
+      echo '<div class="c"><h3>Notes on log retention</h3><p>Keeping 90 days without paying for 90 days.</p></div>'
+      echo '<div class="c"><h3>A postmortem, honestly</h3><p>Four hours down, one missing index.</p></div>'
+      echo '</div></div>'
+      echo '<div class="st"><div class="w">'
+      echo "<div class=\"s\"><b>$NPOST</b><span>Posts</span></div>"
+      echo "<div class=\"s\"><b>$YEAR</b><span>First entry</span></div>"
+      echo '<div class="s"><b>RSS</b><span>Always on</span></div>'
+      echo '</div></div>'
+      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/feed.xml\">RSS</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
+    *)  # documentation / handbook
+      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>&middot;</span>docs</div>"
+      echo '<nav><ul><li><a href="/guides">Guides</a></li><li><a href="/reference">Reference</a></li><li><a href="/faq">FAQ</a></li></ul></nav></div></header>'
+      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
+      echo '<p>Setup guides, reference material and the answers we got tired of repeating in chat.</p>'
+      echo '<a class="btn" href="/guides/getting-started">Start here</a></div></section>'
+      echo '<div class="w"><div class="g">'
+      echo '<div class="c"><h3>Getting started</h3><p>Install, configure, run your first task in about ten minutes.</p></div>'
+      echo '<div class="c"><h3>Configuration</h3><p>Every option, what it defaults to, and when you should not touch it.</p></div>'
+      echo '<div class="c"><h3>Troubleshooting</h3><p>Common failures and how to read the logs when things go sideways.</p></div>'
+      echo '</div></div>'
+      echo '<div class="st"><div class="w">'
+      echo "<div class=\"s\"><b>$NPOST+</b><span>Pages</span></div>"
+      echo '<div class="s"><b>Weekly</b><span>Updated</span></div>'
+      echo '<div class="s"><b>MIT</b><span>Licence</span></div>'
+      echo '</div></div>'
+      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/changelog\">Changelog</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
+  esac
   echo '</body></html>'
 } > /var/www/html/index.html
-grn "  static site: $BN"
+grn "  static site: $BN (layout $LAYOUT)"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
@@ -529,6 +600,26 @@ OUT="/root/${DOMAIN}-panel.txt"
 } > "$OUT"
 chmod 600 "$OUT"
 
+# ---------- 7. install as `rr` for quick re-runs ----------
+# Fetched fresh rather than copied from $0: under bash <(curl ...) the script
+# arrives on a pipe that has already been consumed and cannot be read again.
+# Syntax-checked before it replaces anything, so a truncated download cannot
+# leave a broken command behind.
+RAW_URL="https://raw.githubusercontent.com/pret3nder/edge-bootstrap/master/node-setup.sh"
+if command -v curl >/dev/null; then
+  if curl -fsSL --max-time 20 "$RAW_URL" -o /usr/local/bin/.rr.tmp 2>/dev/null \
+     && bash -n /usr/local/bin/.rr.tmp 2>/dev/null; then
+    mv /usr/local/bin/.rr.tmp /usr/local/bin/rr
+    chmod +x /usr/local/bin/rr
+    RR_READY=1
+  else
+    rm -f /usr/local/bin/.rr.tmp
+    RR_READY=0
+  fi
+else
+  RR_READY=0
+fi
+
 echo
 grn "=== done ==="
 echo "Panel values: $OUT"
@@ -538,3 +629,7 @@ echo "  curl -sI https://$DOMAIN/ | head -2"
 echo "  curl -so /dev/null -w '%{http_code}\\n' https://$DOMAIN/wp-admin"
 echo
 ylw "Next: paste the config profile from that file into the panel, then add the hosts."
+if [ "${RR_READY:-0}" = "1" ]; then
+  echo
+  grn "Installed as 'rr' - re-run on this host with:  rr $DOMAIN"
+fi

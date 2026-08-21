@@ -18,6 +18,18 @@ Prompts read from `/dev/tty`, which keeps them working under both `bash <(curl .
 `curl ... | bash`. Where there is no controlling terminal — cron, CI — the script fails
 with a message naming the missing value instead of hanging.
 
+After a successful run the script installs itself as `rr`, so later runs on that host are
+just:
+
+```bash
+rr                    # asks for what it needs
+rr node.example.com   # or pass the domain
+```
+
+It re-downloads the current version rather than copying itself, and syntax-checks the
+download before replacing the command, so a truncated fetch cannot leave a broken `rr`
+behind.
+
 ## Why
 
 The stock installer brings a node up, but leaves it in a state that needs manual
@@ -36,7 +48,11 @@ This script closes all of that in one pass.
 3. **Writes a hardened nginx config**: `server_tokens off`, 404 on common scanner paths,
    SPA fallback, `access_log off` (the access log is mostly scanner noise and can grow
    to hundreds of megabytes per container).
-4. **Installs a small static site**, deterministically different per domain.
+4. **Installs a small static site**, deterministically different per domain: sixteen
+   brands across four layouts, with the copy figures derived from the domain hash too.
+   The same domain always regenerates the same page, and no two nodes produce an
+   identical document — one page served from a dozen addresses is itself something to
+   correlate on.
 5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.

@@ -36,6 +36,11 @@ It re-downloads the current version rather than copying itself, and syntax-check
 download before replacing the command, so a truncated fetch cannot leave a broken `rr`
 behind.
 
+If another installer already claims `rr` as a shell alias, that alias wins over `PATH`
+and typing `rr` runs the other tool. The script reads the shell rc files to detect this
+— aliases are invisible from a non-interactive shell — and prints the full path plus
+the command to find the alias, rather than claiming an install that does not work.
+
 ## Health check
 
 `rr check` re-tests every failure this tool has met in the field, in one read-only pass:
@@ -124,6 +129,10 @@ listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
 
 Two ways to get one, and the choice is about Certificate Transparency rather than
 convenience.
+
+With neither flag given and a terminal present, the script asks which of the two to
+use instead of defaulting quietly — the node looks identical either way, so the
+consequence would otherwise never surface. A stored Gcore token is reused on re-runs.
 
 ### `--cert-mode http` (default)
 

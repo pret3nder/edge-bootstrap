@@ -366,6 +366,7 @@ case "${1:-}" in
 esac
 
 CERT_MODE=http
+CERT_MODE_SET=0
 GCORE_TOKEN="${GCORE_API_TOKEN:-}"
 
 DOMAIN="${1:-}"
@@ -379,7 +380,7 @@ while [ $# -gt 0 ]; do
     --new-site)    NEW_SITE=1 ;;
     --brand)       shift; BRAND="${1:-}" ;;
     --secret-key)  shift; SECRET_KEY="${1:-}" ;;
-    --cert-mode)   shift; CERT_MODE="${1:-}" ;;
+    --cert-mode)   shift; CERT_MODE="${1:-}"; CERT_MODE_SET=1 ;;
     --gcore-token) shift; GCORE_TOKEN="${1:-}" ;;
     --cert-bundle) shift; CERT_BUNDLE="${1:-}" ;;
     --apex)        shift; APEX_OVERRIDE="${1:-}" ;;
@@ -426,6 +427,38 @@ if [ -z "$DOMAIN" ]; then
 fi
 printf "%s" "$DOMAIN" | grep -qE "$RE_DOMAIN" || die "not a valid domain: $DOMAIN"
 
+
+# Certificate mode. This is the one choice whose consequence is invisible
+# afterwards - the node looks identical either way - so it is asked rather than
+# defaulted quietly. A bundle only makes sense for the wildcard, so it decides
+# on its own.
+if [ -n "${CERT_BUNDLE:-}" ] && [ "$CERT_MODE_SET" = "0" ]; then
+  CERT_MODE=dns; CERT_MODE_SET=1
+fi
+if [ "$CERT_MODE_SET" = "0" ] && can_ask; then
+  printf '\n\033[33m  Certificate for %s\033[0m\n' "$DOMAIN" >/dev/tty
+  printf "    1) per-node, Let's Encrypt over HTTP-01   (as before, nothing to set up)\n" >/dev/tty
+  printf '       Publishes %s to the public Certificate Transparency logs,\n' "$DOMAIN" >/dev/tty
+  printf '       where anyone can list every node under the same apex.\n' >/dev/tty
+  printf '    2) one wildcard for the apex over DNS-01 via Gcore\n' >/dev/tty
+  printf '       CT shows *.<apex> and nothing else, so node names stay unlisted.\n' >/dev/tty
+  printf '       Needs a Gcore API token and the apex zone hosted at Gcore.\n' >/dev/tty
+  CERT_CHOICE=1
+  ask "  choice" CERT_CHOICE '^[12]$' 1 || CERT_CHOICE=1
+  [ "$CERT_CHOICE" = "2" ] && CERT_MODE=dns
+fi
+
+# Re-runs should not need the token pasted again.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && [ -s "$DIR/.gcore-token" ]; then
+  GCORE_TOKEN=$(cat "$DIR/.gcore-token")
+  grn "  certificate: reusing the Gcore token already stored on this host"
+fi
+# Asked here rather than at issuing time: by then compose, nginx and the site
+# have been rewritten, and stopping to prompt in the middle of that is worse
+# than failing before anything was touched.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && can_ask; then
+  ask "  Gcore API token" GCORE_TOKEN '.\{8,\}' || true
+fi
 # Which certificate this node runs on, and which name it has to contain.
 # http: one per node, named after the node. dns: one wildcard for the apex,
 # shared by the fleet. Everything downstream - the compose mounts, the nginx
@@ -1248,5 +1281,24 @@ echo
 ylw "Next: paste the config profile from that file into the panel, then add the hosts."
 if [ "${RR_READY:-0}" = "1" ]; then
   echo
-  grn "Installed as 'rr' - re-run on this host with:  rr $DOMAIN"
+  # Another installer may already own the name. A shell alias beats $PATH, and
+  # aliases are not visible from a non-interactive shell, so the rc files are
+  # read directly rather than asking the shell. Without this the script would
+  # report "installed as rr" while typing rr ran something else entirely.
+  RRA=$(grep -rhoE "^[[:space:]]*alias[[:space:]]+rr=.*" \
+        "$HOME/.bashrc" "$HOME/.bash_aliases" /root/.bashrc /etc/bash.bashrc \
+        /etc/profile.d/*.sh 2>/dev/null | head -1 || true)
+  RRP=$(command -v rr 2>/dev/null || true)
+  if [ -n "$RRA" ]; then
+    ylw "Installed at /usr/local/bin/rr, but 'rr' is a shell alias on this host:"
+    ylw "  $RRA"
+    ylw "An alias wins over PATH, so use the full path or remove it:"
+    echo "  /usr/local/bin/rr $DOMAIN"
+    echo "  grep -rn 'alias rr=' ~/.bashrc ~/.bash_aliases /etc/profile.d/ 2>/dev/null"
+  elif [ -n "$RRP" ] && [ "$RRP" != "/usr/local/bin/rr" ]; then
+    ylw "Installed at /usr/local/bin/rr, but another rr comes first in PATH: $RRP"
+    echo "  run it as:  /usr/local/bin/rr $DOMAIN"
+  else
+    grn "Installed as 'rr' - re-run on this host with:  rr $DOMAIN"
+  fi
 fi

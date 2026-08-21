@@ -84,7 +84,7 @@ detect_panel_ip() {
     /2222/ {
       for (i = 1; i <= NF; i++)
         if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0") { print $i; exit }
-    }')
+    }' || true)
   [ -n "$PANEL_IP" ]
 }
 
@@ -136,7 +136,7 @@ fi
 # domain means rewriting those two lines. Left alone, nginx keeps loading a path that
 # no longer exists, docker helpfully creates a directory there, and the container
 # ends up in a restart loop.
-OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | cut -d/ -f5)
+OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | cut -d/ -f5 || true)
 if [ -n "$OLDCERT" ] && [ "$OLDCERT" != "$DOMAIN" ]; then
   sed -i -E "s|/etc/letsencrypt/live/[^/]+/(fullchain\|privkey)\.pem:/etc/nginx/ssl/[^/]+/(fullchain\|privkey)\.pem|/etc/letsencrypt/live/$DOMAIN/\1.pem:/etc/nginx/ssl/$DOMAIN/\2.pem|g" \
       "$DIR/docker-compose.yml"
@@ -282,7 +282,7 @@ if command -v ufw >/dev/null; then
   drop_rules() {                       # drop_rules <extended-regex over the rule text>
     local re="$1" n guard=0
     while [ $guard -lt 40 ]; do
-      n=$(ufw status numbered 2>/dev/null | grep -E "$re" | head -1 | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/')
+      n=$(ufw status numbered 2>/dev/null | grep -E "$re" | head -1 | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/' || true)
       [ -n "$n" ] || return 0
       ufw --force delete "$n" >/dev/null 2>&1 || return 0
       guard=$((guard + 1))
@@ -303,7 +303,7 @@ if command -v ufw >/dev/null; then
   ufw allow from "$PANEL_IP" to any port 2222 proto tcp >/dev/null
   ufw reload >/dev/null
 
-  STILL=$(ufw status 2>/dev/null | grep -E '(^|[^0-9])(2053|8443)([^0-9]|$)' | head -3)
+  STILL=$(ufw status 2>/dev/null | grep -E '(^|[^0-9])(2053|8443)([^0-9]|$)' | head -3 || true)
   if [ -n "$STILL" ]; then
     ylw "  firewall: these rules survived, remove them by hand:"
     printf '%s\n' "$STILL" | sed 's/^/           /'
@@ -417,15 +417,15 @@ fi
 
 # ---------- 6. keys and panel values ----------
 KEYS=$(docker exec remnanode xray x25519 2>/dev/null || true)
-PRIV=$(printf '%s' "$KEYS" | grep -i 'private' | awk '{print $NF}')
-PUB=$(printf '%s' "$KEYS" | grep -i 'public' | awk '{print $NF}')
+PRIV=$(printf '%s' "$KEYS" | grep -i 'private' | awk '{print $NF}' || true)
+PUB=$(printf '%s' "$KEYS" | grep -i 'public' | awk '{print $NF}' || true)
 SID=$(openssl rand -hex 8)
 SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
 XPATH="${PATHS[$(( 10#$H % ${#PATHS[@]} ))]}"
-SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1)
-SES=$(tr -dc 'a-z' </dev/urandom | head -c1)
+SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
+SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 FF=$(( 140 + 10#$H % 15 ))
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${FF}.0) Gecko/20100101 Firefox/${FF}.0"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

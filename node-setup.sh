@@ -275,6 +275,20 @@ grn "  static site: $BN"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
+  # An inactive ufw stores rules without enforcing any of them, and "no rule matches"
+  # then reads as "port closed" when nothing is filtered at all. Enable it first so the
+  # rest of this section means something. SSH is allowed before enabling, and ufw keeps
+  # established connections, so the current session survives.
+  if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    ylw "  firewall: ufw was inactive - rules existed but nothing was enforced"
+    ufw allow 22/tcp >/dev/null 2>&1 || true
+    if ufw --force enable >/dev/null 2>&1; then
+      grn "  firewall: enabled, SSH allowed first"
+    else
+      red "  firewall: could not enable ufw - every port stays reachable, fix by hand"
+    fi
+  fi
+
   # ufw allow only ever adds. Ports left over from an earlier layout stay open unless
   # their rules are deleted, so anything outside the intended set is dropped first.
   # Rules are matched by number and re-read every iteration, because deleting one
@@ -304,11 +318,13 @@ if command -v ufw >/dev/null; then
   ufw reload >/dev/null
 
   STILL=$(ufw status 2>/dev/null | grep -E '(^|[^0-9])(2053|8443)([^0-9]|$)' | head -3 || true)
-  if [ -n "$STILL" ]; then
+  if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    red "  firewall: ufw is still inactive - nothing below is enforced"
+  elif [ -n "$STILL" ]; then
     ylw "  firewall: these rules survived, remove them by hand:"
     printf '%s\n' "$STILL" | sed 's/^/           /'
   else
-    grn "  firewall: 22, 80, 443 tcp+udp; 2222 restricted to $PANEL_IP; 2053 and 8443 closed"
+    grn "  firewall: active; 22, 80, 443 tcp+udp; 2222 restricted to $PANEL_IP; 2053 and 8443 closed"
   fi
 else
   ylw "  ufw not found - open the ports manually"

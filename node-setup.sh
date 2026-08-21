@@ -132,6 +132,24 @@ else
   ylw "  compose: could not add the /etc/letsencrypt mount - check manually"
 fi
 
+# nginx mounts the certificate by explicit path, so repointing the node at another
+# domain means rewriting those two lines. Left alone, nginx keeps loading a path that
+# no longer exists, docker helpfully creates a directory there, and the container
+# ends up in a restart loop.
+OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | cut -d/ -f5)
+if [ -n "$OLDCERT" ] && [ "$OLDCERT" != "$DOMAIN" ]; then
+  sed -i -E "s|/etc/letsencrypt/live/[^/]+/(fullchain\|privkey)\.pem:/etc/nginx/ssl/[^/]+/(fullchain\|privkey)\.pem|/etc/letsencrypt/live/$DOMAIN/\1.pem:/etc/nginx/ssl/$DOMAIN/\2.pem|g" \
+      "$DIR/docker-compose.yml"
+  grn "  compose: certificate mounts repointed $OLDCERT -> $DOMAIN"
+fi
+
+# Clear placeholders docker created where a certificate file was expected but missing.
+for p in /etc/letsencrypt/live/*/fullchain.pem /etc/letsencrypt/live/*/privkey.pem; do
+  [ -d "$p" ] || continue
+  ylw "  cleanup: removing directory docker left at $p"
+  rm -rf "$p"
+done
+
 # ---------- 2. hardened nginx ----------
 [ -f "$DIR/nginx.conf" ] && cp "$DIR/nginx.conf" "$DIR/nginx.conf.bak-$STAMP"
 {
@@ -334,7 +352,12 @@ if [ "$V" = "$XRAY_EXPECT" ]; then
 else
   red "  Xray '${V:-unknown}', expected $XRAY_EXPECT - XHTTP+REALITY may not work"
 fi
-if docker exec remnawave-nginx grep -qc server_tokens /etc/nginx/conf.d/default.conf 2>/dev/null; then
+NGX_STATE=$(docker inspect -f '{{.State.Status}}' remnawave-nginx 2>/dev/null || echo missing)
+if [ "$NGX_STATE" != "running" ]; then
+  red "  nginx: container is '$NGX_STATE', not running"
+  red "         last lines:"
+  docker logs --tail 5 remnawave-nginx 2>&1 | sed 's/^/           /'
+elif docker exec remnawave-nginx grep -q server_tokens /etc/nginx/conf.d/default.conf 2>/dev/null; then
   grn "  nginx: container is reading the new config"
 else
   red "  nginx: container still sees the OLD config (inode-bound mount)"

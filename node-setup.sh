@@ -346,6 +346,8 @@ while [ $# -gt 0 ]; do
     --email)      shift; EMAIL="${1:-}" ;;
     --force-cert) FORCE_CERT=1 ;;
     --keep-certs) KEEP_CERTS=1 ;;
+    --new-site)   NEW_SITE=1 ;;
+    --brand)      shift; BRAND="${1:-}" ;;
     --secret-key) shift; SECRET_KEY="${1:-}" ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -508,56 +510,179 @@ grn "  nginx: hardened config written"
 
 # ---------- 3. static site ----------
 # Two nodes serving pages that differ only in wording still share a stylesheet,
-# and an identical stylesheet is the easier thing to match on. So the CSS itself
-# is generated: class names, font stack, spacing, corner radius, page width and
-# palette all come from independent bytes of the domain hash. The same domain
-# always rebuilds the same site; two domains do not collide on all of it.
+# and a matching stylesheet is the easier thing to correlate on. So the page is
+# generated rather than filled in: class names, palette, type, spacing, section
+# counts and the copy all come from one per-node seed.
+#
+# The seed is random and stored in $DIR/.site-seed. Deriving it from the domain
+# — which is what this did first — caps the whole fleet at the size of the word
+# lists, so nodes start repeating each other as the fleet grows. A stored random
+# seed keeps re-runs reproducible (same node rebuilds the same site) while the
+# space stays far larger than any fleet. --new-site rerolls it, --brand overrides
+# the name outright when a specific one is wanted.
 mkdir -p /var/www/html
-HX=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-32)
-hb() { printf '%d' "0x${HX:$(( $1 * 2 )):2}"; }   # byte N of the hash, 0-255
+SEEDF="$DIR/.site-seed"
+if [ "${NEW_SITE:-0}" = "1" ] || [ ! -s "$SEEDF" ]; then
+  # Whatever produces it, the seed is checked before it is kept: an openssl that
+  # exits 0 and prints something other than hex would otherwise be trusted.
+  SEED=""
+  if command -v openssl >/dev/null 2>&1; then
+    SEED=$(openssl rand -hex 64 2>/dev/null | tr -dc 'a-f0-9' || true)
+  fi
+  if [ "${#SEED}" -lt 128 ]; then
+    SEED=$(head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \n' || true)
+  fi
+  [ "${#SEED}" -ge 128 ] || die "cannot generate a site seed: no working openssl and /dev/urandom unreadable"
+  printf '%s\n' "$SEED" > "$SEEDF"
+  chmod 600 "$SEEDF" 2>/dev/null || true
+fi
+HX=$(tr -dc 'a-f0-9' < "$SEEDF")
+[ "${#HX}" -ge 128 ] || die "site seed is short or unreadable: $SEEDF (delete it and re-run)"
+hb() { printf '%d' "0x${HX:$(( $1 * 2 )):2}"; }   # byte N of the seed, 0-255
 
-BRANDS=("Northwind|Infrastructure notes and tooling"
-        "Kestrel|Small tools, done properly"
-        "Basalt|Systems engineering studio"
-        "Vellum|Documentation and handbooks"
-        "Tessera|Data plumbing for small teams"
-        "Halcyon|Software, unhurried"
-        "Ridgeway|Practical automation"
-        "Lumen|Interfaces and prototypes"
-        "Alder|Scheduling for background work"
-        "Wren|Field notes on small systems"
-        "Marlowe|Backend consulting"
-        "Foundry|Build and release tooling"
-        "Cairn|Monitoring without the noise"
-        "Thicket|Data pipelines, plainly"
-        "Beacon|Status pages and alerting"
-        "Quarry|Storage and archival")
-ACCENTS=("#3b6ea5" "#2f7a5b" "#8a4b2a" "#5a4b8a" "#2b6b7a" "#2b5a7a" "#7a5a2b" "#7a3f5a"
-         "#4a4a6b" "#3f6b6b" "#6b3f4a" "#556b2f" "#2f5b6b" "#6b5a3f" "#3f4a7a" "#6b6b2b")
+# HSL -> hex in integer arithmetic. The accent comes out of a colour space
+# rather than a list of sixteen, and saturation and lightness stay in a narrow
+# band so the result is a plausible brand colour and not a random RGB triple.
+hsl_hex() {
+  local h=$1 s=$2 l=$3 a c hp d x m r g b
+  a=$(( l * 2 - 100 )); if [ "$a" -lt 0 ]; then a=$(( 0 - a )); fi
+  c=$(( (100 - a) * s / 100 ))
+  hp=$(( h * 100 / 60 ))
+  d=$(( hp % 200 - 100 )); if [ "$d" -lt 0 ]; then d=$(( 0 - d )); fi
+  x=$(( c * (100 - d) / 100 ))
+  m=$(( l - c / 2 ))
+  case $(( h / 60 )) in
+    0) r=$c; g=$x; b=0  ;;
+    1) r=$x; g=$c; b=0  ;;
+    2) r=0;  g=$c; b=$x ;;
+    3) r=0;  g=$x; b=$c ;;
+    4) r=$x; g=0;  b=$c ;;
+    *) r=$c; g=0;  b=$x ;;
+  esac
+  printf '#%02x%02x%02x' $(( (r + m) * 255 / 100 )) $(( (g + m) * 255 / 100 )) $(( (b + m) * 255 / 100 ))
+}
+
+PRE=(Ash Bram Cald Dun Ever Fen Gart Hark Ives Kel Lyn Mor Oak Pell Rown Stan
+     Thorn Vane Wend Yar Alder Bick Cran Dray Elms Far Glen Hol Kirk Lang Nor Sel
+     Ald Barr Colt Dane Esk Fal Grim Haw Ing Lark Mel Ness Orm Quill Redd Sax)
+SFX=(gate mere ridge dale field crest brook stone wick ford mont holt
+     bury cliff marsh haven hurst port side well worth combe glen moor
+     bank cote leigh shaw thwaite vale wold reach)
+CORP=(Labs Works Studio Group Systems Digital Collective Partners
+      Industries Consulting Technologies Associates)
+TAGS=("Infrastructure notes and tooling" "Small tools, done properly"
+      "Systems engineering studio" "Documentation and handbooks"
+      "Data plumbing for small teams" "Software, unhurried"
+      "Practical automation" "Interfaces and prototypes"
+      "Scheduling for background work" "Field notes on small systems"
+      "Backend consulting" "Build and release tooling"
+      "Monitoring without the noise" "Data pipelines, plainly"
+      "Status pages and alerting" "Storage and archival")
 FONTS=('-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif'
        '"Inter","Helvetica Neue",Helvetica,Arial,sans-serif'
        'Georgia,"Times New Roman",Times,serif'
-       'system-ui,"Segoe UI",Roboto,"Noto Sans",sans-serif')
-# Four sets of class names, so the markup does not read as one generator.
-CN0=(wrap nav brand hero grid card strip stat)
-CN1=(container topbar logo lead cols panel band figure)
-CN2=(shell header-inner mark intro items box section-alt metric)
-CN3=(page bar title masthead list tile ribbon number)
+       'system-ui,"Segoe UI",Roboto,"Noto Sans",sans-serif'
+       '"Segoe UI",Tahoma,Geneva,Verdana,sans-serif'
+       'ui-sans-serif,system-ui,-apple-system,"Helvetica Neue",sans-serif'
+       '"Charter","Iowan Old Style",Georgia,serif'
+       'Verdana,Geneva,"DejaVu Sans",sans-serif')
+# Class names are drawn from one pool without replacement, so the markup does
+# not fall into a handful of recognisable sets.
+CPOOL=(wrap container shell page frame layout holder canvas inner bound
+       nav topbar bar navrow menu headnav crossbar
+       brand logo mark title sig ident
+       hero lead intro masthead banner opener
+       grid cols items list tiles deck cluster
+       card panel box tile unit cell block
+       strip band ribbon rail belt
+       stat figure metric number datum counter)
 
-BI=$(( $(hb 0) % 16 )); LAYOUT=$(( $(hb 1) % 4 )); FI=$(( $(hb 2) % 4 ))
-RAD=$(( $(hb 3) % 4 )); CS=$(( $(hb 5) % 4 ))
-MAXW=$(( 860 + $(hb 4) % 5 * 55 ))
-BASE=$(( 15 + $(hb 6) % 3 ))
-H1=$(( 32 + $(hb 7) % 12 ))
-PADY=$(( 56 + $(hb 8) % 32 ))
-YEAR=$(( 2014 + $(hb 9) % 11 ))
-N1=$(( 18 + $(hb 10) % 90 ))
-N2=$(( 3 + $(hb 11) % 40 ))
-case "$RAD" in 0) R=0px ;; 1) R=3px ;; 2) R=6px ;; *) R=10px ;; esac
+POOL=("${CPOOL[@]}")
+PICK=()
+for i in 0 1 2 3 4 5 6 7 8 9; do
+  n=${#POOL[@]}
+  idx=$(( $(hb $(( 24 + i ))) % n ))
+  PICK+=("${POOL[$idx]}")
+  POOL=( "${POOL[@]:0:$idx}" "${POOL[@]:$(( idx + 1 ))}" )
+done
+W=${PICK[0]}; NAVC=${PICK[1]}; BR=${PICK[2]}; HERO=${PICK[3]}; GR=${PICK[4]}
+CD=${PICK[5]}; SP=${PICK[6]}; ST=${PICK[7]}; BTN=${PICK[8]}; FT=${PICK[9]}
 
-BN="${BRANDS[$BI]%%|*}"; BT="${BRANDS[$BI]#*|}"; BC="${ACCENTS[$BI]}"; FSTACK="${FONTS[$FI]}"
-eval "CN=(\"\${CN$CS[@]}\")"
-W=${CN[0]}; NAV=${CN[1]}; BR=${CN[2]}; HERO=${CN[3]}; GR=${CN[4]}; CD=${CN[5]}; SP=${CN[6]}; ST=${CN[7]}
+LAYOUT=$(( $(hb 5) % 4 ))
+FSTACK="${FONTS[$(( $(hb 6) % 8 ))]}"
+case $(( $(hb 7) % 4 )) in 0) R=0px ;; 1) R=3px ;; 2) R=6px ;; *) R=10px ;; esac
+MAXW=$(( 840 + $(hb 8) % 9 * 30 ))
+BASE=$(( 15 + $(hb 9) % 3 ))
+H1=$(( 30 + $(hb 10) % 15 ))
+PADY=$(( 48 + $(hb 11) % 40 ))
+YEAR=$(( 2011 + $(hb 12) % 14 ))
+N1=$(( 18 + $(hb 13) % 90 ))
+N2=$(( 3 + $(hb 14) % 40 ))
+BC=$(hsl_hex $(( $(hb 15) * 360 / 256 )) $(( 26 + $(hb 16) % 34 )) $(( 27 + $(hb 17) % 17 )))
+NCARD=$(( 3 + $(hb 18) % 4 ))
+NSTAT=$(( 2 + $(hb 19) % 3 ))
+NNAV=$(( 3 + $(hb 20) % 2 ))
+
+if [ -n "${BRAND:-}" ]; then
+  BN="$BRAND"
+else
+  BN="${PRE[$(( $(hb 1) % 48 ))]}${SFX[$(( $(hb 2) % 32 ))]}"
+  [ $(( $(hb 0) % 3 )) = 0 ] || BN="$BN ${CORP[$(( $(hb 3) % 12 ))]}"
+fi
+BT="${TAGS[$(( $(hb 4) % 16 ))]}"
+
+case "$LAYOUT" in
+  0) NAVW=(Work Notes About Contact); SEP='.'; TLD=''
+     LEAD='We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.'
+     CTA='See recent work'; CTAH='/work'
+     CT=('Internal tooling' 'Data plumbing' 'Maintenance' 'Discovery' 'Handover' 'Reviews')
+     CP=('Dashboards, admin panels and job runners that teams keep using after launch.'
+         'Ingest, transform, schedule. Boring on purpose, observable by default.'
+         'Long-term care for systems that outlived the team that wrote them.'
+         'Two weeks of reading the code and the tickets before anyone estimates anything.'
+         'Documentation and a walkthrough, so the work does not leave with us.'
+         'A second pair of eyes on a design, an outage or a bill that keeps growing.')
+     SB=("$YEAR" "$N2" '6' "$N1"); SL=('Working since' 'Projects shipped' 'People' 'Releases')
+     F1=/privacy; F1T=Privacy; F2=/contact; F2T=Contact ;;
+  1) NAVW=(Docs Pricing Changelog Status); SEP='/'; TLD='api'
+     LEAD='A small HTTP API for queueing and running deferred jobs. No agents, no sidecars &mdash; one endpoint and a token.'
+     CTA='Read the docs'; CTAH='/docs'
+     CT=('Simple by design' 'Retries built in' 'Observable' 'Scheduling' 'Quotas' 'Webhooks')
+     CP=('One POST creates a job. One GET tells you how it went. That is the whole surface.'
+         'Exponential backoff, dead-letter queue, idempotency keys. Nothing to configure.'
+         'Structured logs and per-job timing out of the box.'
+         'Cron expressions or a delay in seconds, whichever fits the caller.'
+         'Per-token rate limits, so one noisy client cannot starve the rest.'
+         'Delivery with signatures and replay, for callers that would rather be told.')
+     SB=("v2.$(( N2 % 9 ))" '99.9%' "&lt;$(( 55 + N2 % 45 ))ms" "$N1")
+     SL=('Current release' 'Target uptime' 'Median enqueue' 'Regions')
+     F1=/status; F1T=Status; F2=/terms; F2T=Terms ;;
+  2) NAVW=(Archive Tags About Feed); SEP='.'; TLD=''
+     LEAD='Occasional write-ups about builds, failures and the things that only break in production.'
+     CTA='Browse the archive'; CTAH='/archive'
+     CT=('Rewriting the scheduler' 'Notes on log retention' 'A postmortem, honestly'
+         'The index we forgot' 'Cutting the build in half' 'On calling it done')
+     CP=('Why we dropped the queue library and wrote 200 lines instead.'
+         'Keeping 90 days without paying for 90 days.'
+         'Four hours down, one missing index.'
+         'A query that was fast until the table was not small.'
+         'Most of it was waiting on a cache that never hit.'
+         'The last ten percent, and why it took as long as the rest.')
+     SB=("$N1" "$YEAR" 'RSS' "$N2"); SL=('Posts' 'First entry' 'Always on' 'Drafts')
+     F1=/feed.xml; F1T=RSS; F2=/contact; F2T=Contact ;;
+  *) NAVW=(Guides Reference FAQ Support); SEP='&middot;'; TLD=docs
+     LEAD='Setup guides, reference material and the answers we got tired of repeating in chat.'
+     CTA='Start here'; CTAH='/guides/getting-started'
+     CT=('Getting started' 'Configuration' 'Troubleshooting' 'Upgrading' 'Recipes' 'Glossary')
+     CP=('Install, configure, run your first task in about ten minutes.'
+         'Every option, what it defaults to, and when you should not touch it.'
+         'Common failures and how to read the logs when things go sideways.'
+         'What changed, what breaks, and the order to do it in.'
+         'Short worked examples for the things people ask about most.'
+         'The words we use, and what we mean by them.')
+     SB=("$N1+" 'Weekly' 'MIT' "$N2"); SL=('Pages' 'Updated' 'Licence' 'Contributors')
+     F1=/changelog; F1T=Changelog; F2=/contact; F2T=Contact ;;
+esac
 
 {
   echo '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -570,75 +695,48 @@ W=${CN[0]}; NAV=${CN[1]}; BR=${CN[2]}; HERO=${CN[3]}; GR=${CN[4]}; CD=${CN[5]}; 
   echo 'a{color:var(--a);text-decoration:none}a:hover{text-decoration:underline}'
   echo ".$W{max-width:${MAXW}px;margin:0 auto;padding:0 24px}"
   echo 'header{border-bottom:1px solid var(--l);padding:18px 0}'
-  echo ".$NAV{display:flex;align-items:center;justify-content:space-between}"
+  echo ".$NAVC{display:flex;align-items:center;justify-content:space-between}"
   echo ".$BR{font-weight:650;font-size:17px}.$BR span{color:var(--a)}"
   echo 'nav ul{display:flex;gap:22px;list-style:none;font-size:14px}nav a{color:var(--m)}'
   echo ".$HERO{padding:${PADY}px 0 $(( PADY - 16 ))px;border-bottom:1px solid var(--l)}"
   echo ".$HERO h1{font-size:${H1}px;line-height:1.2;letter-spacing:-.6px;max-width:640px}"
   echo ".$HERO p{color:var(--m);margin-top:16px;max-width:560px}"
-  echo ".btn{display:inline-block;margin-top:28px;background:var(--a);color:#fff;padding:10px 18px;border-radius:$R;font-size:14px}"
+  echo ".$BTN{display:inline-block;margin-top:28px;background:var(--a);color:#fff;padding:10px 18px;border-radius:$R;font-size:14px}"
   echo ".$GR{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:28px;padding:${PADY}px 0}"
   echo ".$CD h3{font-size:16px;margin-bottom:8px}.$CD p{color:var(--m);font-size:14px}"
   echo ".$SP{background:var(--s);border-top:1px solid var(--l);border-bottom:1px solid var(--l);padding:40px 0}"
   echo ".$SP .$W{display:flex;flex-wrap:wrap;gap:40px}"
   echo ".$ST b{display:block;font-size:24px}.$ST span{color:var(--m);font-size:13px}"
-  echo 'footer{padding:36px 0;color:var(--m);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}'
+  echo ".$FT{padding:36px 0;color:var(--m);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}"
   echo "@media(max-width:640px){.$HERO h1{font-size:$(( H1 - 9 ))px}nav ul{display:none}}"
   echo '</style></head><body>'
 
-  case "$LAYOUT" in
-    0) NAV1=Work;   NAV2=Notes;     NAV3=About;     SEP='.'; SUF=''
-       LEAD='We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.'
-       CTA='See recent work'; CTAH='/work'
-       C1T='Internal tooling'; C1P='Dashboards, admin panels and job runners that teams keep using after launch.'
-       C2T='Data plumbing';    C2P='Ingest, transform, schedule. Boring on purpose, observable by default.'
-       C3T='Maintenance';      C3P='Long-term care for systems that outlived the team that wrote them.'
-       S1="$YEAR"; S1L='Working since'; S2="$N2"; S2L='Projects shipped'; S3='6'; S3L='People'
-       F1=/privacy; F1T=Privacy; F2=/contact; F2T=Contact ;;
-    1) NAV1=Docs;   NAV2=Pricing;   NAV3=Changelog; SEP='/'; SUF='api'
-       LEAD='A small HTTP API for queueing and running deferred jobs. No agents, no sidecars &mdash; one endpoint and a token.'
-       CTA='Read the docs'; CTAH='/docs'
-       C1T='Simple by design'; C1P='One POST creates a job. One GET tells you how it went. That is the whole surface.'
-       C2T='Retries built in'; C2P='Exponential backoff, dead-letter queue, idempotency keys. Nothing to configure.'
-       C3T='Observable';       C3P='Structured logs and per-job timing out of the box.'
-       S1="v2.$(( N2 % 9 ))"; S1L='Current release'; S2='99.9%'; S2L='Target uptime'; S3="&lt;$(( 55 + N2 % 45 ))ms"; S3L='Median enqueue'
-       F1=/status; F1T=Status; F2=/terms; F2T=Terms ;;
-    2) NAV1=Archive; NAV2=Tags;     NAV3=About;     SEP='.'; SUF=''
-       LEAD='Occasional write-ups about builds, failures and the things that only break in production.'
-       CTA='Browse the archive'; CTAH='/archive'
-       C1T='Rewriting the scheduler'; C1P='Why we dropped the queue library and wrote 200 lines instead.'
-       C2T='Notes on log retention';  C2P='Keeping 90 days without paying for 90 days.'
-       C3T='A postmortem, honestly';  C3P='Four hours down, one missing index.'
-       S1="$N1"; S1L='Posts'; S2="$YEAR"; S2L='First entry'; S3='RSS'; S3L='Always on'
-       F1=/feed.xml; F1T=RSS; F2=/contact; F2T=Contact ;;
-    *) NAV1=Guides; NAV2=Reference; NAV3=FAQ;       SEP='&middot;'; SUF=docs
-       LEAD='Setup guides, reference material and the answers we got tired of repeating in chat.'
-       CTA='Start here'; CTAH='/guides/getting-started'
-       C1T='Getting started'; C1P='Install, configure, run your first task in about ten minutes.'
-       C2T='Configuration';   C2P='Every option, what it defaults to, and when you should not touch it.'
-       C3T='Troubleshooting'; C3P='Common failures and how to read the logs when things go sideways.'
-       S1="$N1+"; S1L='Pages'; S2='Weekly'; S2L='Updated'; S3='MIT'; S3L='Licence'
-       F1=/changelog; F1T=Changelog; F2=/contact; F2T=Contact ;;
-  esac
+  echo "<header><div class=\"$W $NAVC\"><div class=\"$BR\">$BN<span>$SEP</span>$TLD</div>"
+  printf '<nav><ul>'
+  for ((i = 0; i < NNAV; i++)); do
+    printf '<li><a href="/%s">%s</a></li>' "${NAVW[$i],,}" "${NAVW[$i]}"
+  done
+  echo '</ul></nav></div></header>'
 
-  echo "<header><div class=\"$W $NAV\"><div class=\"$BR\">$BN<span>$SEP</span>$SUF</div>"
-  echo "<nav><ul><li><a href=\"/${NAV1,,}\">$NAV1</a></li><li><a href=\"/${NAV2,,}\">$NAV2</a></li><li><a href=\"/${NAV3,,}\">$NAV3</a></li></ul></nav></div></header>"
   echo "<section class=\"$HERO\"><div class=\"$W\"><h1>$BT</h1><p>$LEAD</p>"
-  echo "<a class=\"btn\" href=\"$CTAH\">$CTA</a></div></section>"
+  echo "<a class=\"$BTN\" href=\"$CTAH\">$CTA</a></div></section>"
+
   echo "<div class=\"$W\"><div class=\"$GR\">"
-  echo "<div class=\"$CD\"><h3>$C1T</h3><p>$C1P</p></div>"
-  echo "<div class=\"$CD\"><h3>$C2T</h3><p>$C2P</p></div>"
-  echo "<div class=\"$CD\"><h3>$C3T</h3><p>$C3P</p></div>"
+  for ((i = 0; i < NCARD; i++)); do
+    echo "<div class=\"$CD\"><h3>${CT[$i]}</h3><p>${CP[$i]}</p></div>"
+  done
   echo '</div></div>'
+
   echo "<div class=\"$SP\"><div class=\"$W\">"
-  echo "<div class=\"$ST\"><b>$S1</b><span>$S1L</span></div>"
-  echo "<div class=\"$ST\"><b>$S2</b><span>$S2L</span></div>"
-  echo "<div class=\"$ST\"><b>$S3</b><span>$S3L</span></div>"
+  for ((i = 0; i < NSTAT; i++)); do
+    echo "<div class=\"$ST\"><b>${SB[$i]}</b><span>${SL[$i]}</span></div>"
+  done
   echo '</div></div>'
-  echo "<div class=\"$W\"><footer><div>&copy; 2026 $BN</div><div><a href=\"$F1\">$F1T</a> &middot; <a href=\"$F2\">$F2T</a></div></footer></div>"
+
+  echo "<div class=\"$W\"><footer class=\"$FT\"><div>&copy; 2026 $BN</div><div><a href=\"$F1\">$F1T</a> &middot; <a href=\"$F2\">$F2T</a></div></footer></div>"
   echo '</body></html>'
 } > /var/www/html/index.html
-grn "  static site: $BN (layout $LAYOUT, style $CS)"
+grn "  static site: $BN (layout $LAYOUT, accent $BC)"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
@@ -806,10 +904,10 @@ SID=$(openssl rand -hex 8)
 SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
-XPATH="${PATHS[$(( $(hb 12) % ${#PATHS[@]} ))]}"
+XPATH="${PATHS[$(( $(hb 40) % ${#PATHS[@]} ))]}"
 SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
-FF=$(( 140 + $(hb 13) % 15 ))
+FF=$(( 140 + $(hb 41) % 15 ))
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${FF}.0) Gecko/20100101 Firefox/${FF}.0"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -893,6 +991,11 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "REALITY publicKey  : $PUB"
   echo "shortId            : $SID"
   echo "Salamander         : $SALT"
+  echo
+  echo "--- masquerade site ---"
+  echo "Brand              : $BN"
+  echo "Accent             : $BC"
+  echo "Seed               : $SEEDF (delete or pass --new-site to reroll)"
 } > "$OUT"
 chmod 600 "$OUT"
 

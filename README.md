@@ -5,6 +5,7 @@ itself; on an existing one it brings the node up to the same state.
 
 ```bash
 bash node-setup.sh [domain] [--secret-key <key>] [--email <addr>] [--panel-ip <IP>]
+                            [--force-cert | --keep-certs] [--new-site] [--brand <name>]
 ```
 
 Anything not supplied on the command line is asked for interactively, so the usual
@@ -74,18 +75,36 @@ a newer release is verified.
 3. **Writes a hardened nginx config**: `server_tokens off`, 404 on common scanner paths,
    SPA fallback, `access_log off` (the access log is mostly scanner noise and can grow
    to hundreds of megabytes per container).
-4. **Installs a small static site**, generated per domain. Sixteen brands over four
-   layouts, and the stylesheet itself is generated too: class names, font stack,
-   spacing, corner radius, page width and type scale all come from independent bytes
-   of the domain hash. Pages that differ only in wording still share a stylesheet, and
-   a matching stylesheet is the easier thing to correlate on. Across fourteen domains
-   this yields fourteen distinct stylesheets and fourteen distinct pages.
+4. **Installs a static site**, generated from a per-node seed. Not filled into a
+   template — generated: class names are drawn from a shared pool without
+   replacement, the accent is computed in HSL rather than picked from a list, and
+   type scale, spacing, page width, font stack, section counts and copy all come
+   from separate bytes of the same seed. See below.
 5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.
 6. **Handles the certificate** — see below.
 7. **Generates keys** and writes a ready-to-paste config profile plus host values to
    `/root/<domain>-panel.txt`.
+
+## Masquerade site
+
+The seed lives in `/opt/remnanode/.site-seed` and is random, not derived from the
+domain. Deriving it from the domain is the obvious approach and it is the wrong one:
+it caps the fleet at the size of the word lists, so nodes begin repeating each other
+as the fleet grows, which is the failure this is meant to prevent. A stored seed keeps
+re-runs reproducible — the same node rebuilds the same site — without that ceiling.
+
+Over 200 generated sites, all 200 pages and all 200 stylesheets were distinct. Names
+collided three times in 200; the name space is smaller than the page space because a
+name has to stay pronounceable. At fleet sizes in the tens that is a few percent
+chance of one repeat, so it is worth a look rather than an assumption.
+
+- `--new-site` rerolls the seed and rebuilds the page.
+- `--brand "Name"` sets the name outright, which is the guarantee when one is wanted.
+
+The name in use is recorded in `/root/<domain>-panel.txt`, so a fleet can be checked
+without visiting each site.
 
 ## Inbounds
 

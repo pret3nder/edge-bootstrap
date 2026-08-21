@@ -22,13 +22,25 @@ After a successful run the script installs itself as `rr`, so later runs on that
 just:
 
 ```bash
-rr                    # asks for what it needs
-rr node.example.com   # or pass the domain
+rr                    # menu
+rr node.example.com   # set up or reconfigure
+rr check              # health check, read-only
+rr panel              # print the saved panel values again
 ```
 
 It re-downloads the current version rather than copying itself, and syntax-checks the
 download before replacing the command, so a truncated fetch cannot leave a broken `rr`
 behind.
+
+## Health check
+
+`rr check` re-tests every failure this tool has met in the field, in one read-only pass:
+container state, core version against the expected one, whether nginx is serving the file
+on disk or a stale inode, certificate expiry and renewal method, whether the certificate
+mount still names the domain the node serves, firewall state and exposed ports, what is
+actually listening locally, and the presence of the static site the SPA fallback needs.
+
+It changes nothing, so it is safe on a live node.
 
 ## Why
 

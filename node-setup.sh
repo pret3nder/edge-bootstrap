@@ -59,8 +59,190 @@ ask() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Health check. Every item here is something that has silently broken a node
+# before, so the point is to surface them in one pass instead of discovering
+# them when users complain.
+# Read-only: it never changes anything.
+# ---------------------------------------------------------------------------
+cmd_check() {
+  local d="${1:-}" fails=0 warns=0 v st out days
+
+  # Domain: take the argument, else read it back from the running nginx config.
+  if [ -z "$d" ] && [ -f "$DIR/nginx.conf" ]; then
+    d=$(grep -m1 -oE 'server_name[[:space:]]+[^;]+' "$DIR/nginx.conf" 2>/dev/null | awk '{print $2}' || true)
+  fi
+
+  echo
+  ylw "=== health check${d:+ | $d} ==="
+
+  # --- containers -----------------------------------------------------------
+  for c in remnanode remnawave-nginx; do
+    st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+    if [ "$st" = "running" ]; then
+      grn "  container $c: running"
+    else
+      red "  container $c: $st"
+      [ "$st" = "restarting" ] && docker logs --tail 3 "$c" 2>&1 | sed 's/^/      /'
+      fails=$((fails + 1))
+    fi
+  done
+
+  # --- core version ---------------------------------------------------------
+  # A floating tag has twice pulled a core where XHTTP over REALITY is broken:
+  # the node starts and looks healthy while two inbounds quietly do nothing.
+  v=$(docker logs remnanode 2>&1 | grep -a -m1 "Xray version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+  if [ "$v" = "$XRAY_EXPECT" ]; then
+    grn "  core: $v"
+  else
+    red "  core: ${v:-unknown}, expected $XRAY_EXPECT"
+    fails=$((fails + 1))
+  fi
+  if grep -q "image: remnawave/node:latest" "$DIR/docker-compose.yml" 2>/dev/null; then
+    ylw "  image: pinned to latest - the next pull can change the core silently"
+    warns=$((warns + 1))
+  fi
+
+  # --- nginx is serving the file on disk ------------------------------------
+  # The config is a file-bound mount, so docker holds it by inode. An upload that
+  # replaces the file leaves the container reading the old one, and a reload
+  # re-reads that same stale inode without complaining.
+  if docker exec remnawave-nginx grep -q server_tokens /etc/nginx/conf.d/default.conf 2>/dev/null; then
+    grn "  nginx: serving the current config"
+  else
+    red "  nginx: container is not serving the hardened config"
+    red "         fix: docker compose up -d --force-recreate remnawave-nginx"
+    fails=$((fails + 1))
+  fi
+
+  # --- certificate ----------------------------------------------------------
+  if [ -n "$d" ] && [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ]; then
+    days=$(( ( $(date -d "$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$d/fullchain.pem" 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    if [ "$days" -gt 20 ]; then grn "  certificate: valid, $days days left"
+    elif [ "$days" -gt 0 ]; then ylw "  certificate: only $days days left"; warns=$((warns + 1))
+    else red "  certificate: expired or unreadable"; fails=$((fails + 1)); fi
+  else
+    red "  certificate: none for ${d:-this node}"
+    fails=$((fails + 1))
+  fi
+
+  # Renewal through standalone cannot work while nginx holds :80.
+  if [ -n "$d" ] && [ -f "/etc/letsencrypt/renewal/$d.conf" ]; then
+    if grep -q '^authenticator[[:space:]]*=[[:space:]]*standalone' "/etc/letsencrypt/renewal/$d.conf"; then
+      red "  renewal: standalone, which needs port 80 that nginx now holds"
+      fails=$((fails + 1))
+    else
+      grn "  renewal: webroot"
+    fi
+  fi
+
+  # The mount names a fixed path; repointing the node without updating it leaves
+  # nginx loading a certificate that is no longer there.
+  out=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | head -1 | cut -d/ -f5 || true)
+  if [ -n "$out" ] && [ -n "$d" ] && [ "$out" != "$d" ]; then
+    red "  compose: certificate mount points at $out, node serves $d"
+    fails=$((fails + 1))
+  fi
+  if ! grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml" 2>/dev/null; then
+    red "  compose: /etc/letsencrypt is not mounted into remnanode - Hysteria2 cannot read the certificate"
+    fails=$((fails + 1))
+  fi
+
+  # --- firewall -------------------------------------------------------------
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    grn "  firewall: active"
+    for p in 2053 8443; do
+      if ufw status 2>/dev/null | grep -qE "(^|[^0-9])$p([^0-9]|\$)"; then
+        ylw "  firewall: a rule for $p is still present"
+        warns=$((warns + 1))
+      fi
+    done
+    if ufw status 2>/dev/null | grep -qE '2222.*(Anywhere|0\.0\.0\.0)'; then
+      red "  firewall: NODE_PORT is open to the internet - it identifies the node to anyone scanning"
+      fails=$((fails + 1))
+    fi
+  else
+    red "  firewall: inactive - rules may exist but nothing is enforced"
+    fails=$((fails + 1))
+  fi
+
+  # --- what is actually listening ------------------------------------------
+  # More trustworthy than an external scan: some providers accept TCP at their
+  # edge on every port, which makes a remote probe look wrong.
+  out=$(ss -ltn 2>/dev/null | awk 'NR>1 {n=split($4,a,":"); print a[n]}' | sort -un | tr '\n' ' ' || true)
+  echo "  listening tcp: ${out:-none}"
+  for p in 2053 8443; do
+    case " $out " in *" $p "*) ylw "  listening: $p is still bound - the panel profile still has that inbound"; warns=$((warns + 1)) ;; esac
+  done
+  case " $out " in *" 2222 "*) grn "  node port 2222: listening" ;; *) red "  node port 2222: not listening - the panel cannot reach this node"; fails=$((fails + 1)) ;; esac
+
+  # --- site -----------------------------------------------------------------
+  if [ -s /var/www/html/index.html ]; then
+    grn "  static site: present ($(grep -m1 -oE '<title>[^<]*' /var/www/html/index.html 2>/dev/null | sed 's/<title>//' || echo untitled))"
+  else
+    red "  static site: missing - the SPA fallback will loop and return 500 on everything"
+    fails=$((fails + 1))
+  fi
+
+  echo
+  if [ "$fails" -gt 0 ]; then
+    red "  $fails problem(s), $warns warning(s)"
+  elif [ "$warns" -gt 0 ]; then
+    ylw "  no problems, $warns warning(s)"
+  else
+    grn "  all checks passed"
+  fi
+  return 0
+}
+
+# Re-print the values a setup run produced. They are needed again whenever the
+# node is re-added in the panel, and the file is easy to lose track of.
+cmd_panel() {
+  local d="${1:-}" f
+  if [ -z "$d" ] && [ -f "$DIR/nginx.conf" ]; then
+    d=$(grep -m1 -oE 'server_name[[:space:]]+[^;]+' "$DIR/nginx.conf" 2>/dev/null | awk '{print $2}' || true)
+  fi
+  f="/root/${d}-panel.txt"
+  if [ -n "$d" ] && [ -f "$f" ]; then
+    cat "$f"
+  else
+    red "No saved panel values${d:+ for $d}."
+    ylw "Run a setup pass to regenerate them - note that this issues new keys"
+    ylw "and disconnects existing clients of this node."
+    return 1
+  fi
+}
+
+menu() {
+  can_ask || return 1
+  local choice
+  while :; do
+    printf '\n\033[33m  edge-bootstrap\033[0m\n' >/dev/tty
+    printf '    1) set up / reconfigure this node\n' >/dev/tty
+    printf '    2) health check\n' >/dev/tty
+    printf '    3) show panel values\n' >/dev/tty
+    printf '    0) exit\n' >/dev/tty
+    printf '  choice: ' >/dev/tty
+    read -r choice </dev/tty || return 1
+    case "$choice" in
+      1) ACTION=setup; return 0 ;;
+      2) ACTION=check; return 0 ;;
+      3) ACTION=panel; return 0 ;;
+      0) exit 0 ;;
+      *) red "  pick 0-3" >/dev/tty ;;
+    esac
+  done
+}
+
 RE_DOMAIN='^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
 RE_IP='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+# First positional argument is either a sub-command or the domain.
+ACTION=setup
+case "${1:-}" in
+  check|panel|setup) ACTION="$1"; shift ;;
+  menu)              ACTION=menu; shift ;;
+esac
 
 DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
@@ -89,13 +271,26 @@ detect_panel_ip() {
 }
 
 [ "$(id -u)" = "0" ] || die "must run as root"
+[ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
+command -v docker >/dev/null || die "docker is not installed"
+
+# With no arguments at all and a terminal available, offer the menu.
+if [ "$ACTION" = "setup" ] && [ -z "$DOMAIN" ] && can_ask && [ -f "$DIR/nginx.conf" ]; then
+  ACTION=menu
+fi
+[ "$ACTION" = "menu" ] && { menu || die "no terminal for the menu"; }
+
+case "$ACTION" in
+  check) cmd_check "$DOMAIN"; exit 0 ;;
+  panel) cmd_panel "$DOMAIN"; exit $? ;;
+esac
+
+# ---- from here on: setup ----
 if [ -z "$DOMAIN" ]; then
   ask "Node domain (selfsteal domain used during installation)" DOMAIN "$RE_DOMAIN"     || die "domain required: bash node-setup.sh node.example.com"
 fi
 printf "%s" "$DOMAIN" | grep -qE "$RE_DOMAIN" || die "not a valid domain: $DOMAIN"
-[ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
 [ -f "$DIR/docker-compose.yml" ] || die "missing $DIR/docker-compose.yml"
-command -v docker >/dev/null || die "docker is not installed"
 command -v certbot >/dev/null || die "certbot is not installed"
 
 if detect_panel_ip; then

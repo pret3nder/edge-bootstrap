@@ -507,38 +507,57 @@ done
 grn "  nginx: hardened config written"
 
 # ---------- 3. static site ----------
-# The page has to differ per node: one identical document served from a dozen
-# addresses is itself something to correlate on. Brand, accent colour and layout
-# are all derived from the domain hash, so a node regenerates the same site every
-# time while no two nodes share one.
+# Two nodes serving pages that differ only in wording still share a stylesheet,
+# and an identical stylesheet is the easier thing to match on. So the CSS itself
+# is generated: class names, font stack, spacing, corner radius, page width and
+# palette all come from independent bytes of the domain hash. The same domain
+# always rebuilds the same site; two domains do not collide on all of it.
 mkdir -p /var/www/html
-H=$(printf '%s' "$DOMAIN" | md5sum | tr -dc '0-9' | cut -c1-9)
-[ -z "$H" ] && H=123456789
-BRANDS=("Northwind|Infrastructure notes and tooling|#3b6ea5"
-        "Kestrel|Small tools, done properly|#2f7a5b"
-        "Basalt|Systems engineering studio|#8a4b2a"
-        "Vellum|Documentation and handbooks|#5a4b8a"
-        "Tessera|Data plumbing for small teams|#2b6b7a"
-        "Halcyon|Software, unhurried|#2b5a7a"
-        "Ridgeway|Practical automation|#7a5a2b"
-        "Lumen|Interfaces and prototypes|#7a3f5a"
-        "Alder|Scheduling for background work|#4a4a6b"
-        "Wren|Field notes on small systems|#3f6b6b"
-        "Marlowe|Backend consulting|#6b3f4a"
-        "Foundry|Build and release tooling|#556b2f"
-        "Cairn|Monitoring without the noise|#2f5b6b"
-        "Thicket|Data pipelines, plainly|#6b5a3f"
-        "Beacon|Status pages and alerting|#3f4a7a"
-        "Quarry|Storage and archival|#6b6b2b")
-IDX=$(( 10#${H:0:6} % ${#BRANDS[@]} ))
-LAYOUT=$(( 10#${H:6:2} % 4 ))
-BN="${BRANDS[$IDX]%%|*}"
-REST="${BRANDS[$IDX]#*|}"
-BT="${REST%%|*}"
-BC="${REST#*|}"
-YEAR=$(( 2015 + 10#${H:0:2} % 10 ))
-NPOST=$(( 20 + 10#${H:2:2} % 80 ))
-NPROJ=$(( 10 + 10#${H:4:2} % 60 ))
+HX=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-32)
+hb() { printf '%d' "0x${HX:$(( $1 * 2 )):2}"; }   # byte N of the hash, 0-255
+
+BRANDS=("Northwind|Infrastructure notes and tooling"
+        "Kestrel|Small tools, done properly"
+        "Basalt|Systems engineering studio"
+        "Vellum|Documentation and handbooks"
+        "Tessera|Data plumbing for small teams"
+        "Halcyon|Software, unhurried"
+        "Ridgeway|Practical automation"
+        "Lumen|Interfaces and prototypes"
+        "Alder|Scheduling for background work"
+        "Wren|Field notes on small systems"
+        "Marlowe|Backend consulting"
+        "Foundry|Build and release tooling"
+        "Cairn|Monitoring without the noise"
+        "Thicket|Data pipelines, plainly"
+        "Beacon|Status pages and alerting"
+        "Quarry|Storage and archival")
+ACCENTS=("#3b6ea5" "#2f7a5b" "#8a4b2a" "#5a4b8a" "#2b6b7a" "#2b5a7a" "#7a5a2b" "#7a3f5a"
+         "#4a4a6b" "#3f6b6b" "#6b3f4a" "#556b2f" "#2f5b6b" "#6b5a3f" "#3f4a7a" "#6b6b2b")
+FONTS=('-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif'
+       '"Inter","Helvetica Neue",Helvetica,Arial,sans-serif'
+       'Georgia,"Times New Roman",Times,serif'
+       'system-ui,"Segoe UI",Roboto,"Noto Sans",sans-serif')
+# Four sets of class names, so the markup does not read as one generator.
+CN0=(wrap nav brand hero grid card strip stat)
+CN1=(container topbar logo lead cols panel band figure)
+CN2=(shell header-inner mark intro items box section-alt metric)
+CN3=(page bar title masthead list tile ribbon number)
+
+BI=$(( $(hb 0) % 16 )); LAYOUT=$(( $(hb 1) % 4 )); FI=$(( $(hb 2) % 4 ))
+RAD=$(( $(hb 3) % 4 )); CS=$(( $(hb 5) % 4 ))
+MAXW=$(( 860 + $(hb 4) % 5 * 55 ))
+BASE=$(( 15 + $(hb 6) % 3 ))
+H1=$(( 32 + $(hb 7) % 12 ))
+PADY=$(( 56 + $(hb 8) % 32 ))
+YEAR=$(( 2014 + $(hb 9) % 11 ))
+N1=$(( 18 + $(hb 10) % 90 ))
+N2=$(( 3 + $(hb 11) % 40 ))
+case "$RAD" in 0) R=0px ;; 1) R=3px ;; 2) R=6px ;; *) R=10px ;; esac
+
+BN="${BRANDS[$BI]%%|*}"; BT="${BRANDS[$BI]#*|}"; BC="${ACCENTS[$BI]}"; FSTACK="${FONTS[$FI]}"
+eval "CN=(\"\${CN$CS[@]}\")"
+W=${CN[0]}; NAV=${CN[1]}; BR=${CN[2]}; HERO=${CN[3]}; GR=${CN[4]}; CD=${CN[5]}; SP=${CN[6]}; ST=${CN[7]}
 
 {
   echo '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -547,99 +566,79 @@ NPROJ=$(( 10 + 10#${H:4:2} % 60 ))
   echo '<style>'
   echo ":root{--a:$BC;--ink:#1c1f23;--m:#5d6672;--l:#e4e7eb;--s:#f6f7f9}"
   echo '*{box-sizing:border-box;margin:0;padding:0}'
-  echo 'body{font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:#fff}'
+  echo "body{font:${BASE}px/1.65 $FSTACK;color:var(--ink);background:#fff}"
   echo 'a{color:var(--a);text-decoration:none}a:hover{text-decoration:underline}'
-  echo '.w{max-width:960px;margin:0 auto;padding:0 24px}'
+  echo ".$W{max-width:${MAXW}px;margin:0 auto;padding:0 24px}"
   echo 'header{border-bottom:1px solid var(--l);padding:18px 0}'
-  echo '.n{display:flex;align-items:center;justify-content:space-between}'
-  echo '.b{font-weight:650;font-size:17px}.b span{color:var(--a)}'
+  echo ".$NAV{display:flex;align-items:center;justify-content:space-between}"
+  echo ".$BR{font-weight:650;font-size:17px}.$BR span{color:var(--a)}"
   echo 'nav ul{display:flex;gap:22px;list-style:none;font-size:14px}nav a{color:var(--m)}'
-  echo '.h{padding:72px 0 56px;border-bottom:1px solid var(--l)}'
-  echo '.h h1{font-size:38px;line-height:1.2;letter-spacing:-.6px;max-width:640px}'
-  echo '.h p{color:var(--m);margin-top:16px;max-width:560px}'
-  echo '.btn{display:inline-block;margin-top:28px;background:var(--a);color:#fff;padding:10px 18px;border-radius:6px;font-size:14px}'
-  echo '.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:28px;padding:56px 0}'
-  echo '.c h3{font-size:16px;margin-bottom:8px}.c p{color:var(--m);font-size:14px}'
-  echo '.st{background:var(--s);border-top:1px solid var(--l);border-bottom:1px solid var(--l);padding:40px 0}'
-  echo '.st .w{display:flex;flex-wrap:wrap;gap:40px}'
-  echo '.s b{display:block;font-size:24px}.s span{color:var(--m);font-size:13px}'
+  echo ".$HERO{padding:${PADY}px 0 $(( PADY - 16 ))px;border-bottom:1px solid var(--l)}"
+  echo ".$HERO h1{font-size:${H1}px;line-height:1.2;letter-spacing:-.6px;max-width:640px}"
+  echo ".$HERO p{color:var(--m);margin-top:16px;max-width:560px}"
+  echo ".btn{display:inline-block;margin-top:28px;background:var(--a);color:#fff;padding:10px 18px;border-radius:$R;font-size:14px}"
+  echo ".$GR{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:28px;padding:${PADY}px 0}"
+  echo ".$CD h3{font-size:16px;margin-bottom:8px}.$CD p{color:var(--m);font-size:14px}"
+  echo ".$SP{background:var(--s);border-top:1px solid var(--l);border-bottom:1px solid var(--l);padding:40px 0}"
+  echo ".$SP .$W{display:flex;flex-wrap:wrap;gap:40px}"
+  echo ".$ST b{display:block;font-size:24px}.$ST span{color:var(--m);font-size:13px}"
   echo 'footer{padding:36px 0;color:var(--m);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}'
-  echo '@media(max-width:640px){.h h1{font-size:29px}nav ul{display:none}}'
+  echo "@media(max-width:640px){.$HERO h1{font-size:$(( H1 - 9 ))px}nav ul{display:none}}"
   echo '</style></head><body>'
 
   case "$LAYOUT" in
-    0)  # studio / agency
-      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>.</span></div>"
-      echo '<nav><ul><li><a href="/work">Work</a></li><li><a href="/notes">Notes</a></li><li><a href="/about">About</a></li></ul></nav></div></header>'
-      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
-      echo '<p>We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.</p>'
-      echo '<a class="btn" href="/work">See recent work</a></div></section>'
-      echo '<div class="w"><div class="g">'
-      echo '<div class="c"><h3>Internal tooling</h3><p>Dashboards, admin panels and job runners that teams keep using after launch.</p></div>'
-      echo '<div class="c"><h3>Data plumbing</h3><p>Ingest, transform, schedule. Boring on purpose, observable by default.</p></div>'
-      echo '<div class="c"><h3>Maintenance</h3><p>Long-term care for systems that outlived the team that wrote them.</p></div>'
-      echo '</div></div>'
-      echo '<div class="st"><div class="w">'
-      echo "<div class=\"s\"><b>$YEAR</b><span>Working since</span></div>"
-      echo "<div class=\"s\"><b>$NPROJ</b><span>Projects shipped</span></div>"
-      echo '<div class="s"><b>6</b><span>People</span></div>'
-      echo '</div></div>'
-      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/privacy\">Privacy</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
-    1)  # small SaaS / API
-      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>/</span>api</div>"
-      echo '<nav><ul><li><a href="/docs">Docs</a></li><li><a href="/pricing">Pricing</a></li><li><a href="/changelog">Changelog</a></li></ul></nav></div></header>'
-      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
-      echo '<p>A small HTTP API for queueing and running deferred jobs. No agents, no sidecars &mdash; one endpoint and a token.</p>'
-      echo '<a class="btn" href="/docs">Read the docs</a></div></section>'
-      echo '<div class="w"><div class="g">'
-      echo '<div class="c"><h3>Simple by design</h3><p>One POST creates a job. One GET tells you how it went. That is the whole surface.</p></div>'
-      echo '<div class="c"><h3>Retries built in</h3><p>Exponential backoff, dead-letter queue, idempotency keys. Nothing to configure.</p></div>'
-      echo '<div class="c"><h3>Observable</h3><p>Structured logs and per-job timing out of the box.</p></div>'
-      echo '</div></div>'
-      echo '<div class="st"><div class="w">'
-      echo "<div class=\"s\"><b>v2.$(( 10#${H:0:1} ))</b><span>Current release</span></div>"
-      echo '<div class="s"><b>99.9%</b><span>Target uptime</span></div>'
-      echo "<div class=\"s\"><b>&lt;$(( 60 + 10#${H:1:2} % 40 ))ms</b><span>Median enqueue</span></div>"
-      echo '</div></div>'
-      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/status\">Status</a> &middot; <a href=\"/terms\">Terms</a></div></footer></div>" ;;
-    2)  # engineering notes / blog
-      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>.</span></div>"
-      echo '<nav><ul><li><a href="/archive">Archive</a></li><li><a href="/tags">Tags</a></li><li><a href="/about">About</a></li></ul></nav></div></header>'
-      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
-      echo '<p>Occasional write-ups about builds, failures and the things that only break in production.</p>'
-      echo '<a class="btn" href="/archive">Browse the archive</a></div></section>'
-      echo '<div class="w"><div class="g">'
-      echo '<div class="c"><h3>Rewriting the scheduler</h3><p>Why we dropped the queue library and wrote 200 lines instead.</p></div>'
-      echo '<div class="c"><h3>Notes on log retention</h3><p>Keeping 90 days without paying for 90 days.</p></div>'
-      echo '<div class="c"><h3>A postmortem, honestly</h3><p>Four hours down, one missing index.</p></div>'
-      echo '</div></div>'
-      echo '<div class="st"><div class="w">'
-      echo "<div class=\"s\"><b>$NPOST</b><span>Posts</span></div>"
-      echo "<div class=\"s\"><b>$YEAR</b><span>First entry</span></div>"
-      echo '<div class="s"><b>RSS</b><span>Always on</span></div>'
-      echo '</div></div>'
-      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/feed.xml\">RSS</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
-    *)  # documentation / handbook
-      echo "<header><div class=\"w n\"><div class=\"b\">$BN<span>&middot;</span>docs</div>"
-      echo '<nav><ul><li><a href="/guides">Guides</a></li><li><a href="/reference">Reference</a></li><li><a href="/faq">FAQ</a></li></ul></nav></div></header>'
-      echo "<section class=\"h\"><div class=\"w\"><h1>$BT</h1>"
-      echo '<p>Setup guides, reference material and the answers we got tired of repeating in chat.</p>'
-      echo '<a class="btn" href="/guides/getting-started">Start here</a></div></section>'
-      echo '<div class="w"><div class="g">'
-      echo '<div class="c"><h3>Getting started</h3><p>Install, configure, run your first task in about ten minutes.</p></div>'
-      echo '<div class="c"><h3>Configuration</h3><p>Every option, what it defaults to, and when you should not touch it.</p></div>'
-      echo '<div class="c"><h3>Troubleshooting</h3><p>Common failures and how to read the logs when things go sideways.</p></div>'
-      echo '</div></div>'
-      echo '<div class="st"><div class="w">'
-      echo "<div class=\"s\"><b>$NPOST+</b><span>Pages</span></div>"
-      echo '<div class="s"><b>Weekly</b><span>Updated</span></div>'
-      echo '<div class="s"><b>MIT</b><span>Licence</span></div>'
-      echo '</div></div>'
-      echo "<div class=\"w\"><footer><div>&copy; 2026 $BN</div><div><a href=\"/changelog\">Changelog</a> &middot; <a href=\"/contact\">Contact</a></div></footer></div>" ;;
+    0) NAV1=Work;   NAV2=Notes;     NAV3=About;     SEP='.'; SUF=''
+       LEAD='We design and maintain small, reliable systems &mdash; internal tools, data pipelines and the unglamorous plumbing that keeps them running.'
+       CTA='See recent work'; CTAH='/work'
+       C1T='Internal tooling'; C1P='Dashboards, admin panels and job runners that teams keep using after launch.'
+       C2T='Data plumbing';    C2P='Ingest, transform, schedule. Boring on purpose, observable by default.'
+       C3T='Maintenance';      C3P='Long-term care for systems that outlived the team that wrote them.'
+       S1="$YEAR"; S1L='Working since'; S2="$N2"; S2L='Projects shipped'; S3='6'; S3L='People'
+       F1=/privacy; F1T=Privacy; F2=/contact; F2T=Contact ;;
+    1) NAV1=Docs;   NAV2=Pricing;   NAV3=Changelog; SEP='/'; SUF='api'
+       LEAD='A small HTTP API for queueing and running deferred jobs. No agents, no sidecars &mdash; one endpoint and a token.'
+       CTA='Read the docs'; CTAH='/docs'
+       C1T='Simple by design'; C1P='One POST creates a job. One GET tells you how it went. That is the whole surface.'
+       C2T='Retries built in'; C2P='Exponential backoff, dead-letter queue, idempotency keys. Nothing to configure.'
+       C3T='Observable';       C3P='Structured logs and per-job timing out of the box.'
+       S1="v2.$(( N2 % 9 ))"; S1L='Current release'; S2='99.9%'; S2L='Target uptime'; S3="&lt;$(( 55 + N2 % 45 ))ms"; S3L='Median enqueue'
+       F1=/status; F1T=Status; F2=/terms; F2T=Terms ;;
+    2) NAV1=Archive; NAV2=Tags;     NAV3=About;     SEP='.'; SUF=''
+       LEAD='Occasional write-ups about builds, failures and the things that only break in production.'
+       CTA='Browse the archive'; CTAH='/archive'
+       C1T='Rewriting the scheduler'; C1P='Why we dropped the queue library and wrote 200 lines instead.'
+       C2T='Notes on log retention';  C2P='Keeping 90 days without paying for 90 days.'
+       C3T='A postmortem, honestly';  C3P='Four hours down, one missing index.'
+       S1="$N1"; S1L='Posts'; S2="$YEAR"; S2L='First entry'; S3='RSS'; S3L='Always on'
+       F1=/feed.xml; F1T=RSS; F2=/contact; F2T=Contact ;;
+    *) NAV1=Guides; NAV2=Reference; NAV3=FAQ;       SEP='&middot;'; SUF=docs
+       LEAD='Setup guides, reference material and the answers we got tired of repeating in chat.'
+       CTA='Start here'; CTAH='/guides/getting-started'
+       C1T='Getting started'; C1P='Install, configure, run your first task in about ten minutes.'
+       C2T='Configuration';   C2P='Every option, what it defaults to, and when you should not touch it.'
+       C3T='Troubleshooting'; C3P='Common failures and how to read the logs when things go sideways.'
+       S1="$N1+"; S1L='Pages'; S2='Weekly'; S2L='Updated'; S3='MIT'; S3L='Licence'
+       F1=/changelog; F1T=Changelog; F2=/contact; F2T=Contact ;;
   esac
+
+  echo "<header><div class=\"$W $NAV\"><div class=\"$BR\">$BN<span>$SEP</span>$SUF</div>"
+  echo "<nav><ul><li><a href=\"/${NAV1,,}\">$NAV1</a></li><li><a href=\"/${NAV2,,}\">$NAV2</a></li><li><a href=\"/${NAV3,,}\">$NAV3</a></li></ul></nav></div></header>"
+  echo "<section class=\"$HERO\"><div class=\"$W\"><h1>$BT</h1><p>$LEAD</p>"
+  echo "<a class=\"btn\" href=\"$CTAH\">$CTA</a></div></section>"
+  echo "<div class=\"$W\"><div class=\"$GR\">"
+  echo "<div class=\"$CD\"><h3>$C1T</h3><p>$C1P</p></div>"
+  echo "<div class=\"$CD\"><h3>$C2T</h3><p>$C2P</p></div>"
+  echo "<div class=\"$CD\"><h3>$C3T</h3><p>$C3P</p></div>"
+  echo '</div></div>'
+  echo "<div class=\"$SP\"><div class=\"$W\">"
+  echo "<div class=\"$ST\"><b>$S1</b><span>$S1L</span></div>"
+  echo "<div class=\"$ST\"><b>$S2</b><span>$S2L</span></div>"
+  echo "<div class=\"$ST\"><b>$S3</b><span>$S3L</span></div>"
+  echo '</div></div>'
+  echo "<div class=\"$W\"><footer><div>&copy; 2026 $BN</div><div><a href=\"$F1\">$F1T</a> &middot; <a href=\"$F2\">$F2T</a></div></footer></div>"
   echo '</body></html>'
 } > /var/www/html/index.html
-grn "  static site: $BN (layout $LAYOUT)"
+grn "  static site: $BN (layout $LAYOUT, style $CS)"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
@@ -807,10 +806,10 @@ SID=$(openssl rand -hex 8)
 SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
-XPATH="${PATHS[$(( 10#$H % ${#PATHS[@]} ))]}"
+XPATH="${PATHS[$(( $(hb 12) % ${#PATHS[@]} ))]}"
 SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
-FF=$(( 140 + 10#$H % 15 ))
+FF=$(( 140 + $(hb 13) % 15 ))
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${FF}.0) Gecko/20100101 Firefox/${FF}.0"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"

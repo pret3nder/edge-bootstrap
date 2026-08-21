@@ -74,11 +74,12 @@ a newer release is verified.
 3. **Writes a hardened nginx config**: `server_tokens off`, 404 on common scanner paths,
    SPA fallback, `access_log off` (the access log is mostly scanner noise and can grow
    to hundreds of megabytes per container).
-4. **Installs a small static site**, deterministically different per domain: sixteen
-   brands across four layouts, with the copy figures derived from the domain hash too.
-   The same domain always regenerates the same page, and no two nodes produce an
-   identical document — one page served from a dozen addresses is itself something to
-   correlate on.
+4. **Installs a small static site**, generated per domain. Sixteen brands over four
+   layouts, and the stylesheet itself is generated too: class names, font stack,
+   spacing, corner radius, page width and type scale all come from independent bytes
+   of the domain hash. Pages that differ only in wording still share a stylesheet, and
+   a matching stylesheet is the easier thing to correlate on. Across fourteen domains
+   this yields fourteen distinct stylesheets and fourteen distinct pages.
 5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.

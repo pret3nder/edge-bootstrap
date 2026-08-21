@@ -4,8 +4,19 @@ Post-install setup for a Remnawave node. Run it **after** the stock installer �
 it does not replace it.
 
 ```bash
-bash node-setup.sh <domain> [--email <addr>] [--force-cert] [--keep-certs] [--panel-ip <IP>]
+bash node-setup.sh [domain] [--email <addr>] [--force-cert] [--keep-certs] [--panel-ip <IP>]
 ```
+
+Anything not supplied on the command line is asked for interactively, so the usual
+invocation is just:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/pret3nder/edge-bootstrap/master/node-setup.sh)
+```
+
+Prompts read from `/dev/tty`, which keeps them working under both `bash <(curl ...)` and
+`curl ... | bash`. Where there is no controlling terminal — cron, CI — the script fails
+with a message naming the missing value instead of hanging.
 
 ## Why
 
@@ -72,8 +83,8 @@ renewal is automated and verified on every run.
 ## Panel IP
 
 Read automatically from the existing ufw rule on `NODE_PORT`, which the stock installer
-already creates. Override with the `PANEL_IP` environment variable or `--panel-ip`.
-If none of the three yields an address, the script stops instead of guessing.
+already creates. Override with the `PANEL_IP` environment variable or `--panel-ip`. If none of those
+yields an address, the script asks for it.
 
 ## Certificate renewal
 

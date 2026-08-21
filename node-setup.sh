@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # node-setup.sh - post-install setup for a Remnawave node. Run after the stock installer.
 #
-#   bash node-setup.sh <domain> [options]
+#   bash node-setup.sh [domain] [options]
+#
+# Anything not supplied on the command line is asked for interactively;
+# with no controlling terminal the script fails with a clear message instead.
 #
 # Options:
 #   --panel-ip <IP>   panel address for the NODE_PORT rule (auto-detected by default)
@@ -9,8 +12,7 @@
 #   --force-cert      drop the current certificate and issue a fresh one
 #   --keep-certs      keep certificates belonging to other domains
 #
-# The panel IP is read from the existing ufw rule on NODE_PORT.
-# If there is no such rule, pass PANEL_IP=<IP> or --panel-ip <IP>.
+# The panel IP is read from the existing ufw rule on NODE_PORT, and asked for if absent.
 #
 # What it does:
 #   1. pins remnawave/node to a known-good tag and verifies the running core version
@@ -34,6 +36,31 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 die(){ red "ERROR: $*"; exit 1; }
+
+# Prompting reads from /dev/tty rather than stdin, so it works both with
+#   bash <(curl -Ls URL)   and   curl -Ls URL | bash
+# In a context with no controlling terminal it degrades to a clear error.
+can_ask(){ : >/dev/tty 2>/dev/null; }
+
+# ask <prompt> <varname> [validating-regex] [default]
+ask() {
+  local prompt="$1" var="$2" re="${3:-.}" def="${4:-}" answer
+  can_ask || return 1
+  while :; do
+    if [ -n "$def" ]; then printf '\033[33m%s\033[0m [%s]: ' "$prompt" "$def" >/dev/tty
+    else                   printf '\033[33m%s\033[0m: '      "$prompt"       >/dev/tty; fi
+    read -r answer </dev/tty || return 1
+    [ -z "$answer" ] && answer="$def"
+    if [ -n "$answer" ] && printf '%s' "$answer" | grep -qE "$re"; then
+      printf -v "$var" '%s' "$answer"
+      return 0
+    fi
+    red "  invalid value, try again" >/dev/tty
+  done
+}
+
+RE_DOMAIN='^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
+RE_IP='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
 DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
@@ -62,15 +89,22 @@ detect_panel_ip() {
 }
 
 [ "$(id -u)" = "0" ] || die "must run as root"
-[ -n "$DOMAIN" ] || die "domain required: bash node-setup.sh node.example.com"
+if [ -z "$DOMAIN" ]; then
+  ask "Node domain (selfsteal domain used during installation)" DOMAIN "$RE_DOMAIN"     || die "domain required: bash node-setup.sh node.example.com"
+fi
+printf "%s" "$DOMAIN" | grep -qE "$RE_DOMAIN" || die "not a valid domain: $DOMAIN"
 [ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
 [ -f "$DIR/docker-compose.yml" ] || die "missing $DIR/docker-compose.yml"
 command -v docker >/dev/null || die "docker is not installed"
 command -v certbot >/dev/null || die "certbot is not installed"
 
-detect_panel_ip || die "could not determine the panel IP.
+if detect_panel_ip; then
+  grn "  panel IP taken from the existing firewall rule: $PANEL_IP"
+else
+  ask "Panel IP address (the one the node connects back to)" PANEL_IP "$RE_IP"     || die "could not determine the panel IP.
   Via env:  PANEL_IP=1.2.3.4 bash node-setup.sh $DOMAIN
   Via flag: bash node-setup.sh $DOMAIN --panel-ip 1.2.3.4"
+fi
 
 STAMP="$(date +%F-%H%M)"
 echo
@@ -265,6 +299,10 @@ fi
 if cert_ok "$DOMAIN"; then
   grn "  certificate: existing one is valid, reusing it"
 else
+  if [ -z "${EMAIL:-}" ] && can_ask; then
+    ask "E-mail for expiry notices (optional, press Enter to skip)" EMAIL ".*" "-" || true
+    [ "${EMAIL:-}" = "-" ] && EMAIL=""
+  fi
   docker stop remnawave-nginx >/dev/null 2>&1 || true
   if [ -n "${EMAIL:-}" ]; then
     certbot certonly --standalone -d "$DOMAIN" --agree-tos --non-interactive \

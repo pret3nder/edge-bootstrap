@@ -1,10 +1,10 @@
 # edge-bootstrap
 
-Post-install setup for a Remnawave node. Run it **after** the stock installer —
-it does not replace it.
+Installs and configures a Remnawave node. On a bare server it installs everything
+itself; on an existing one it brings the node up to the same state.
 
 ```bash
-bash node-setup.sh [domain] [--email <addr>] [--force-cert] [--keep-certs] [--panel-ip <IP>]
+bash node-setup.sh [domain] [--secret-key <key>] [--email <addr>] [--panel-ip <IP>]
 ```
 
 Anything not supplied on the command line is asked for interactively, so the usual
@@ -42,12 +42,26 @@ actually listening locally, and the presence of the static site the SPA fallback
 
 It changes nothing, so it is safe on a live node.
 
-## Why
+## Bare server
 
-The stock installer brings a node up, but leaves it in a state that needs manual
-follow-up: the image floats on `latest`, nginx ships without hardening, more ports
-are exposed than necessary, and the config profile has to be assembled by hand.
-This script closes all of that in one pass.
+With no node in `/opt/remnanode` the script installs one: docker and compose v2,
+certbot, ufw, then a `docker-compose.yml` pinned to a known-good image with the
+certificate mounted into `remnanode` from the start. It asks for the SECRET_KEY from
+the node card in the panel, which is the one value nothing local can derive.
+
+From there the run continues exactly as it would on an existing node, so a fresh
+server reaches a configured node in a single command.
+
+## Why pin the version
+
+A floating tag has twice pulled a core where XHTTP over REALITY is broken
+([XTLS/Xray-core#6482](https://github.com/XTLS/Xray-core/issues/6482)). The node starts,
+the panel shows it connected, and two inbounds quietly do nothing — which reads as a
+network problem and is debugged as one.
+
+The exact number matters less than the pinning. `NODE_IMAGE` and `XRAY_EXPECT` at the
+top of the script are simply the pair currently known to work; move them together once
+a newer release is verified.
 
 ## What it does
 

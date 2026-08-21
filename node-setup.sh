@@ -237,6 +237,100 @@ menu() {
 RE_DOMAIN='^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
 RE_IP='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
+# ---------------------------------------------------------------------------
+# Bare-metal install. Everything the node needs, so a fresh server goes from
+# nothing to a configured node in one run.
+# ---------------------------------------------------------------------------
+install_prereqs() {
+  local want="" c
+  for c in curl certbot ufw openssl; do
+    command -v "$c" >/dev/null 2>&1 || want="$want $c"
+  done
+  command -v docker >/dev/null 2>&1 || want="$want docker.io"
+
+  if [ -n "$want" ]; then
+    ylw "  installing:$want"
+    apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $want >/dev/null 2>&1 || true
+  fi
+
+  # compose v2 ships as its own package on Ubuntu; without it "docker compose"
+  # is not a command and every later step fails in a confusing way.
+  if ! docker compose version >/dev/null 2>&1; then
+    ylw "  installing: docker-compose-v2"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
+      || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 \
+      || true
+  fi
+
+  systemctl enable --now docker >/dev/null 2>&1 || true
+}
+
+install_node() {
+  ylw "  no node in $DIR - installing one"
+  install_prereqs
+  command -v docker >/dev/null 2>&1 || die "docker could not be installed"
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 could not be installed"
+
+  # The key identifies this node to the panel. It is created when the node is
+  # added there and is copied from its card; nothing generates it locally.
+  if [ -z "${SECRET_KEY:-}" ]; then
+    echo >/dev/tty
+    ylw "  Open the node in the panel and copy its SECRET_KEY." >/dev/tty
+    ask "SECRET_KEY" SECRET_KEY '^[A-Za-z0-9+/=_-]{80,}$' \
+      || die "SECRET_KEY is required - pass it with --secret-key <value>"
+  fi
+
+  mkdir -p "$DIR" /var/www/html
+  cat > "$DIR/docker-compose.yml" <<COMPOSE
+x-common: &common
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  restart: always
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  remnawave-nginx:
+    image: nginx:1.28
+    container_name: remnawave-nginx
+    hostname: remnawave-nginx
+    <<: [*common, *logging]
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/$DOMAIN/fullchain.pem:ro
+      - /etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/$DOMAIN/privkey.pem:ro
+      - /dev/shm:/dev/shm:rw
+      - /var/www/html:/var/www/html:ro
+    command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
+
+  remnanode:
+    image: $NODE_IMAGE
+    container_name: remnanode
+    hostname: remnanode
+    <<: [*common, *logging]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY=$SECRET_KEY
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /dev/shm:/dev/shm:rw
+COMPOSE
+  chmod 600 "$DIR/docker-compose.yml"
+  grn "  node installed in $DIR"
+}
+
 # First positional argument is either a sub-command or the domain.
 ACTION=setup
 case "${1:-}" in
@@ -252,6 +346,7 @@ while [ $# -gt 0 ]; do
     --email)      shift; EMAIL="${1:-}" ;;
     --force-cert) FORCE_CERT=1 ;;
     --keep-certs) KEEP_CERTS=1 ;;
+    --secret-key) shift; SECRET_KEY="${1:-}" ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -271,8 +366,11 @@ detect_panel_ip() {
 }
 
 [ "$(id -u)" = "0" ] || die "must run as root"
-[ -d "$DIR" ] || die "$DIR not found - run the stock installer first"
-command -v docker >/dev/null || die "docker is not installed"
+NEED_INSTALL=0
+if [ ! -f "$DIR/docker-compose.yml" ]; then
+  [ "$ACTION" = "setup" ] || die "no node in $DIR - run a setup pass first"
+  NEED_INSTALL=1
+fi
 
 # With no arguments at all and a terminal available, offer the menu.
 if [ "$ACTION" = "setup" ] && [ -z "$DOMAIN" ] && can_ask && [ -f "$DIR/nginx.conf" ]; then
@@ -290,7 +388,9 @@ if [ -z "$DOMAIN" ]; then
   ask "Node domain (selfsteal domain used during installation)" DOMAIN "$RE_DOMAIN"     || die "domain required: bash node-setup.sh node.example.com"
 fi
 printf "%s" "$DOMAIN" | grep -qE "$RE_DOMAIN" || die "not a valid domain: $DOMAIN"
-[ -f "$DIR/docker-compose.yml" ] || die "missing $DIR/docker-compose.yml"
+
+# Domain is known now, so the compose file can name the right certificate paths.
+[ "$NEED_INSTALL" = "1" ] && install_node
 command -v certbot >/dev/null || die "certbot is not installed"
 
 if detect_panel_ip; then
@@ -321,6 +421,8 @@ if ! grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml"; then
     { print }
   ' "$DIR/docker-compose.yml" > "$DIR/.dc.tmp" && mv "$DIR/.dc.tmp" "$DIR/docker-compose.yml"
 fi
+# The file holds SECRET_KEY, and awk-into-temp-then-mv resets the mode to 0644.
+chmod 600 "$DIR/docker-compose.yml" 2>/dev/null || true
 if grep -q '/etc/letsencrypt:/etc/letsencrypt' "$DIR/docker-compose.yml"; then
   grn "  compose: image pinned, certificate mount present"
 else

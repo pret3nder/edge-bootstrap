@@ -275,16 +275,41 @@ grn "  static site: $BN"
 
 # ---------- 4. firewall ----------
 if command -v ufw >/dev/null; then
-  while ufw status numbered 2>/dev/null | grep -qE '^\[[ 0-9]+\].*2222.*Anywhere'; do
-    N=$(ufw status numbered | grep -E '^\[[ 0-9]+\].*2222.*Anywhere' | head -1 | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/')
-    ufw --force delete "$N" >/dev/null
+  # ufw allow only ever adds. Ports left over from an earlier layout stay open unless
+  # their rules are deleted, so anything outside the intended set is dropped first.
+  # Rules are matched by number and re-read every iteration, because deleting one
+  # renumbers the rest. The counter is a guard against a rule that refuses to go away.
+  drop_rules() {                       # drop_rules <extended-regex over the rule text>
+    local re="$1" n guard=0
+    while [ $guard -lt 40 ]; do
+      n=$(ufw status numbered 2>/dev/null | grep -E "$re" | head -1 | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/')
+      [ -n "$n" ] || return 0
+      ufw --force delete "$n" >/dev/null 2>&1 || return 0
+      guard=$((guard + 1))
+    done
+  }
+
+  # ports this layout does not use; also catches multiport rules like "443,2222/tcp"
+  for p in 2053 8443; do
+    drop_rules "^\[[ 0-9]+\].*(^|[^0-9])$p([^0-9]|\$)" && true
   done
+  # any NODE_PORT rule that is not already limited to the panel
+  drop_rules "^\[[ 0-9]+\].*2222.*(Anywhere|0\.0\.0\.0)"
+
+  ufw allow 22/tcp  >/dev/null 2>&1 || true      # keep SSH reachable no matter what
   ufw allow 443/tcp >/dev/null
   ufw allow 443/udp >/dev/null
   ufw allow 80/tcp  >/dev/null
   ufw allow from "$PANEL_IP" to any port 2222 proto tcp >/dev/null
   ufw reload >/dev/null
-  grn "  firewall: 80, 443 tcp+udp; 2222 restricted to $PANEL_IP"
+
+  STILL=$(ufw status 2>/dev/null | grep -E '(^|[^0-9])(2053|8443)([^0-9]|$)' | head -3)
+  if [ -n "$STILL" ]; then
+    ylw "  firewall: these rules survived, remove them by hand:"
+    printf '%s\n' "$STILL" | sed 's/^/           /'
+  else
+    grn "  firewall: 22, 80, 443 tcp+udp; 2222 restricted to $PANEL_IP; 2053 and 8443 closed"
+  fi
 else
   ylw "  ufw not found - open the ports manually"
 fi

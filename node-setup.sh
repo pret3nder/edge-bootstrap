@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # node-setup.sh — доводит ноду Remnawave до рабочего стандарта ПОСЛЕ штатного установщика.
 #
-#   bash node-setup.sh <домен> [--trojan] [--panel-ip <IP>]
+#   bash node-setup.sh <домен> [--panel-ip <IP>]
 #
 # Что делает:
 #   1. пинит remnawave/node на проверенную версию (latest ломал XHTTP+REALITY)
 #   2. добавляет в docker-compose монт /etc/letsencrypt в remnanode (нужен Hysteria2/Trojan)
 #   3. кладёт hardened nginx (server_tokens off, probe-404, SPA-fallback, access_log off)
 #   4. ставит правдоподобный сайт-заглушку, разную на каждом домене
-#   5. firewall: наружу только 443 tcp+udp (+8443 при --trojan), NODE_PORT только с IP панели
+#   5. firewall: наружу только 443 tcp+udp , NODE_PORT только с IP панели
 #   6. генерит ключи и пишет ГОТОВЫЙ Config Profile + значения хостов в файл
 #
-# Набор инбаундов: XHTTP-REALITY (443/tcp) + Hysteria2 (443/udp) [+ Trojan 8443].
+# Набор инбаундов: XHTTP-REALITY (443/tcp) + Hysteria2 (443/udp) .
 # VLESS-PQ и HTTPUpgrade намеренно не ставятся: непопулярны, а лишние порты палят ноду.
 set -euo pipefail
 
@@ -19,7 +19,6 @@ NODE_IMAGE="remnawave/node:2.8.0"     # Xray 26.6.27 — версия, на ко
 XRAY_EXPECT="26.6.27"
 PANEL_IP="144.31.4.204"
 DIR="/opt/remnanode"
-TROJAN=0
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
@@ -30,7 +29,6 @@ DOMAIN="${1:-}"
 [ $# -gt 0 ] && shift
 while [ $# -gt 0 ]; do
   case "$1" in
-    --trojan)   TROJAN=1 ;;
     --panel-ip) shift; PANEL_IP="${1:-}" ;;
     *) die "неизвестный аргумент: $1" ;;
   esac
@@ -38,17 +36,15 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = "0" ] || die "нужен root"
-[ -n "$DOMAIN" ] || die "укажи домен: bash node-setup.sh node.example.com [--trojan]"
+[ -n "$DOMAIN" ] || die "укажи домен: bash node-setup.sh node.example.com"
 [ -d "$DIR" ] || die "$DIR не найден — сначала отработай штатный установщик"
 [ -f "$DIR/docker-compose.yml" ] || die "нет $DIR/docker-compose.yml"
 command -v docker >/dev/null || die "docker не установлен"
 [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] || die "нет сертификата для $DOMAIN"
 
 STAMP="$(date +%F-%H%M)"
-TRJ_TXT="нет"
-[ "$TROJAN" = "1" ] && TRJ_TXT="да"
 echo
-ylw "=== $DOMAIN | образ $NODE_IMAGE | Trojan: $TRJ_TXT ==="
+ylw "=== $DOMAIN | образ $NODE_IMAGE ==="
 
 # ---------- 1. docker-compose ----------
 cp "$DIR/docker-compose.yml" "$DIR/docker-compose.yml.bak-$STAMP"
@@ -87,6 +83,14 @@ fi
   echo 'ssl_session_tickets off;'
   echo 'access_log off;'
   echo ''
+  echo 'server {'
+  echo '    listen 80;'
+  echo "    server_name $DOMAIN;"
+  echo '    location /.well-known/acme-challenge/ { root /var/www/html; }'
+  echo '    location / { return 301 https://$host$request_uri; }'
+  echo '}'
+  echo ''
+
   echo 'server {'
   echo "    server_name $DOMAIN;"
   echo '    listen unix:/dev/shm/nginx.sock ssl proxy_protocol;'
@@ -196,7 +200,6 @@ if command -v ufw >/dev/null; then
   ufw allow 443/tcp >/dev/null
   ufw allow 443/udp >/dev/null
   ufw allow 80/tcp  >/dev/null
-  [ "$TROJAN" = "1" ] && ufw allow 8443/tcp >/dev/null
   ufw allow from "$PANEL_IP" to any port 2222 proto tcp >/dev/null
   ufw reload >/dev/null
   grn "  firewall: 443 tcp+udp, 80, 2222 только с $PANEL_IP"
@@ -223,6 +226,33 @@ if docker exec remnawave-nginx grep -qc server_tokens /etc/nginx/conf.d/default.
   grn "  nginx: контейнер читает новый конфиг"
 else
   red "  nginx: контейнер видит СТАРЫЙ конфиг (маунт по inode)"
+fi
+
+# ---------- 5b. обновление сертификата: standalone -> webroot ----------
+# nginx теперь держит :80, поэтому certbot --standalone при продлении упадёт.
+# Переводим на webroot и сразу проверяем dry-run; не вышло — откатываем.
+RCONF="/etc/letsencrypt/renewal/${DOMAIN}.conf"
+if [ -f "$RCONF" ] && command -v certbot >/dev/null; then
+  if grep -q '^authenticator[[:space:]]*=[[:space:]]*standalone' "$RCONF"; then
+    cp "$RCONF" "${RCONF}.bak-$STAMP"
+    sed -i -E 's|^authenticator[[:space:]]*=.*|authenticator = webroot|' "$RCONF"
+    grep -q '^webroot_path' "$RCONF" && sed -i -E 's|^webroot_path[[:space:]]*=.*|webroot_path = /var/www/html,|' "$RCONF"                                      || sed -i -E '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RCONF"
+    if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
+      grn "  сертификат: продление переведено на webroot, dry-run прошёл"
+    else
+      cp "${RCONF}.bak-$STAMP" "$RCONF"
+      red "  сертификат: webroot не заработал, откатил на standalone."
+      red "              При таком раскладе продление конфликтует с nginx на :80 — проверь вручную!"
+    fi
+  else
+    if certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
+      grn "  сертификат: продление работает"
+    else
+      ylw "  сертификат: dry-run продления не прошёл — проверь 'certbot renew --dry-run'"
+    fi
+  fi
+else
+  ylw "  сертификат: renewal-конфиг или certbot не найдены, продление не проверено"
 fi
 
 # ---------- 6. ключи и данные для панели ----------
@@ -283,16 +313,6 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '        "tlsSettings": { "alpn": ["h3"],'
   echo "          \"certificates\": [{ \"certificateFile\": \"$CERTF\", \"keyFile\": \"$KEYF\" }] },"
   echo '        "hysteriaSettings": { "version": 2 } }'
-  if [ "$TROJAN" = "1" ]; then
-    echo '    },'
-    echo '    {'
-    echo "      \"tag\": \"TROJAN-$SUF\", \"port\": 8443, \"listen\": \"0.0.0.0\", \"protocol\": \"trojan\","
-    echo '      "settings": { "clients": [] },'
-    echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
-    echo '      "streamSettings": { "network": "raw", "security": "tls",'
-    echo '        "tlsSettings": { "minVersion": "1.2", "rejectUnknownSni": true,'
-    echo "          \"certificates\": [{ \"certificateFile\": \"$CERTF\", \"keyFile\": \"$KEYF\" }] } }"
-  fi
   echo '    }'
   echo '  ],'
   echo '  "outbounds": ['
@@ -324,12 +344,6 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "Адрес/Порт : $DOMAIN / 443     ALPN: h3"
   echo "Кнопка Final Mask:"
   echo "{ \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\" } }"
-  if [ "$TROJAN" = "1" ]; then
-    echo
-    echo "--- Host: $DOMAIN [trojan] ---"
-    echo "Инбаунд    : TROJAN-$SUF"
-    echo "Адрес/Порт : $DOMAIN / 8443    SNI: $DOMAIN    Отпечаток: firefox"
-  fi
   echo
   echo "--- ключи ноды ---"
   echo "REALITY privateKey : $PRIV"

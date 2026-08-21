@@ -1004,9 +1004,12 @@ chmod 600 "$OUT"
 # arrives on a pipe that has already been consumed and cannot be read again.
 # Syntax-checked before it replaces anything, so a truncated download cannot
 # leave a broken command behind.
+# The query string is a cache-buster: the raw CDN serves a stale copy for some
+# minutes after a push, so installing rr right after an update would otherwise
+# fetch the previous version and report success.
 RAW_URL="https://raw.githubusercontent.com/pret3nder/edge-bootstrap/master/node-setup.sh"
 if command -v curl >/dev/null; then
-  if curl -fsSL --max-time 20 "$RAW_URL" -o /usr/local/bin/.rr.tmp 2>/dev/null \
+  if curl -fsSL --max-time 20 "$RAW_URL?$(date +%s)" -H "Cache-Control: no-cache" -o /usr/local/bin/.rr.tmp 2>/dev/null \
      && bash -n /usr/local/bin/.rr.tmp 2>/dev/null; then
     mv /usr/local/bin/.rr.tmp /usr/local/bin/rr
     chmod +x /usr/local/bin/rr

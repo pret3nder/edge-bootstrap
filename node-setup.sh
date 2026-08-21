@@ -3,6 +3,9 @@
 #
 #   bash node-setup.sh <домен> [--panel-ip <IP>]
 #
+# IP панели определяется автоматически из правила ufw на NODE_PORT.
+# Если правила нет — передай PANEL_IP=<IP> или --panel-ip <IP>.
+#
 # Что делает:
 #   1. пинит remnawave/node на проверенную версию (latest ломал XHTTP+REALITY)
 #   2. добавляет в docker-compose монт /etc/letsencrypt в remnanode (нужен Hysteria2/Trojan)
@@ -17,7 +20,7 @@ set -euo pipefail
 
 NODE_IMAGE="remnawave/node:2.8.0"     # Xray 26.6.27 — версия, на которой работает парк
 XRAY_EXPECT="26.6.27"
-PANEL_IP="144.31.4.204"
+PANEL_IP="${PANEL_IP:-}"          # см. detect_panel_ip ниже
 DIR="/opt/remnanode"
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
@@ -34,6 +37,19 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# IP панели: явный флаг --panel-ip -> переменная окружения PANEL_IP ->
+# существующее правило firewall на NODE_PORT (его ставит штатный установщик).
+detect_panel_ip() {
+  [ -n "${PANEL_IP:-}" ] && return 0
+  command -v ufw >/dev/null 2>&1 || return 1
+  PANEL_IP=$(ufw status 2>/dev/null | awk '
+    /2222/ {
+      for (i = 1; i <= NF; i++)
+        if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0") { print $i; exit }
+    }')
+  [ -n "$PANEL_IP" ]
+}
 
 [ "$(id -u)" = "0" ] || die "нужен root"
 [ -n "$DOMAIN" ] || die "укажи домен: bash node-setup.sh node.example.com"

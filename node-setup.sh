@@ -499,9 +499,20 @@ if [ "$CERT_MODE" = "dns" ] && [ -z "${CERT_BUNDLE:-}" ] \
   CERT_SRC=1
   ask "  choice" CERT_SRC '^[12]$' 1 || CERT_SRC=1
   if [ "$CERT_SRC" = "1" ]; then
-    ask "  path to the bundle" CERT_BUNDLE '^/.+' || true
-    [ -n "${CERT_BUNDLE:-}" ] || die "no bundle given. Run 'rr cert-export' on the node that
-  already holds the wildcard, copy the file here, and pass --cert-bundle <path>."
+    # The bundle usually is not here yet at this point, and a prompt that only
+    # accepts an absolute path is a dead end when the answer is "I have not made
+    # it". "-" backs out to issuing rather than forcing a Ctrl+C and a re-run.
+    printf '    Not made yet? Run  rr cert-export  on a node that has the wildcard and\n' >/dev/tty
+    printf '    copy the file over. Enter - to issue a new one instead.\n' >/dev/tty
+    ask "  path to the bundle (or -)" CERT_BUNDLE '^(/.+|-)$' || CERT_BUNDLE="-"
+    if [ "$CERT_BUNDLE" = "-" ]; then
+      CERT_BUNDLE=""
+      ylw "  certificate: issuing a new wildcard - one of five per week for the fleet"
+    elif [ ! -f "$CERT_BUNDLE" ]; then
+      die "no such file: $CERT_BUNDLE
+  Run 'rr cert-export' on the node that already holds the wildcard, copy the
+  file here, then re-run with --cert-bundle <path>."
+    fi
   fi
 fi
 

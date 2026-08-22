@@ -138,7 +138,7 @@ cmd_check() {
 
   # The mount names a fixed path; repointing the node without updating it leaves
   # nginx loading a certificate that is no longer there.
-  out=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | head -1 | cut -d/ -f5 || true)
+  out=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | head -1 | sed -E 's|.*/live/([^/]+)/.*|\1|' || true)
   # A wildcard is stored under the apex, so a mount naming the parent of the
   # served domain is correct and must not be reported as a mismatch.
   if [ -n "$out" ] && [ -n "$d" ] && [ "$out" != "$d" ] && [ "${d%".$out"}" = "$d" ]; then
@@ -351,12 +351,14 @@ COMPOSE
   chmod 600 "$DIR/docker-compose.yml"
   grn "  node installed in $DIR"
 
+}
+
 # Pack this node's certificate for the rest of the fleet. Let's Encrypt caps
 # identical certificates at five a week, so one host issues the wildcard and
 # every other node imports the result rather than asking for its own.
 cmd_cert_export() {
   local out="${1:-}" name
-  name=$(grep -m1 -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | cut -d/ -f5 || true)
+  name=$(grep -m1 -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" 2>/dev/null | sed -E 's|.*/live/([^/]+)/.*|\1|' || true)
   [ -n "$name" ] || die "cannot tell which certificate this node uses - no $DIR/docker-compose.yml?"
   [ -f "/etc/letsencrypt/live/$name/fullchain.pem" ] || die "no certificate at /etc/letsencrypt/live/$name"
   [ -n "$out" ] || out="/root/$name-cert.tgz"
@@ -370,7 +372,6 @@ cmd_cert_export() {
   echo "    rr <node-domain> --cert-mode dns --cert-bundle /root/$(basename "$out")"
   echo
   echo "  Renewal stays on this host. Re-export and re-import before expiry."
-}
 }
 # First positional argument is either a sub-command or the domain.
 ACTION=setup
@@ -429,6 +430,17 @@ if [ "$ACTION" = "setup" ] && [ -z "$DOMAIN" ] && can_ask && [ -f "$DIR/nginx.co
   ACTION=menu
 fi
 [ "$ACTION" = "menu" ] && { menu || die "no terminal for the menu"; }
+
+# A copy that lost its tail still parses, and only fails later when the dispatch
+# reaches for a function that is not there - which reads as
+# "line 424: cmd_cert_export: command not found" and blames the wrong thing.
+# Seen in the field. Check up front and say what is actually wrong.
+for _f in cmd_check cmd_panel cmd_cert_export menu install_node; do
+  declare -F "$_f" >/dev/null 2>&1 || die "this copy of the script is incomplete: $_f is missing.
+  It parsed, so the download was cut at a point that happens to be valid syntax.
+  Replace it:
+    curl -Ls 'https://raw.githubusercontent.com/pret3nder/edge-bootstrap/master/node-setup.sh?'\$(date +%s) -o /usr/local/bin/rr && chmod +x /usr/local/bin/rr"
+done
 
 case "$ACTION" in
   check) cmd_check "$DOMAIN"; exit 0 ;;
@@ -572,7 +584,7 @@ fi
 # domain means rewriting those two lines. Left alone, nginx keeps loading a path that
 # no longer exists, docker helpfully creates a directory there, and the container
 # ends up in a restart loop.
-OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | cut -d/ -f5 || true)
+OLDCERT=$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain\.pem' "$DIR/docker-compose.yml" | head -1 | sed -E 's|.*/live/([^/]+)/.*|\1|' || true)
 if [ -n "$OLDCERT" ] && [ "$OLDCERT" != "$CERTNAME" ]; then
   sed -i -E "s|/etc/letsencrypt/live/[^/]+/(fullchain\|privkey)\.pem:/etc/nginx/ssl/[^/]+/(fullchain\|privkey)\.pem|/etc/letsencrypt/live/$CERTNAME/\1.pem:/etc/nginx/ssl/$CERTNAME/\2.pem|g" \
       "$DIR/docker-compose.yml"
@@ -1320,7 +1332,9 @@ chmod 600 "$OUT"
 RAW_URL="https://raw.githubusercontent.com/pret3nder/edge-bootstrap/master/node-setup.sh"
 if command -v curl >/dev/null; then
   if curl -fsSL --max-time 20 "$RAW_URL?$(date +%s)" -H "Cache-Control: no-cache" -o /usr/local/bin/.rr.tmp 2>/dev/null \
-     && bash -n /usr/local/bin/.rr.tmp 2>/dev/null; then
+     && bash -n /usr/local/bin/.rr.tmp 2>/dev/null \
+     && grep -q '^# EOF-MARKER:' /usr/local/bin/.rr.tmp \
+     && grep -q '^cmd_cert_export()' /usr/local/bin/.rr.tmp; then
     mv /usr/local/bin/.rr.tmp /usr/local/bin/rr
     chmod +x /usr/local/bin/rr
     RR_READY=1
@@ -1364,3 +1378,7 @@ if [ "${RR_READY:-0}" = "1" ]; then
     grn "Installed as 'rr' - re-run on this host with:  rr $DOMAIN"
   fi
 fi
+
+# EOF-MARKER: the last line of this file. The rr installer checks for it, since
+# a download truncated at a syntactically complete point still passes bash -n,
+# and a copy missing its tail dispatches to functions that are no longer there.

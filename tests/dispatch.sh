@@ -80,6 +80,31 @@ echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q "hardened nginx" && { echo "  ⚠ panel провалился в setup"; fail=1; }
 
 echo
+echo "=== cert-export ==="
+# Повод: cmd_cert_export оказалась вложена ВНУТРЬ install_node(). Файл при этом
+# парсился, диспетчер её вызывал, а определялась она только после запуска
+# установки - на живой ноде это "cmd_cert_export: command not found".
+OUT=$(bash "$S" cert-export 2>&1); RC=$?
+echo "$OUT" | sed 's/^/  /'
+[ "$RC" = "0" ] || { echo "  ⚠ cert-export вернул $RC"; fail=1; }
+echo "$OUT" | grep -q 'command not found' && { echo "  ⚠ функция не определена на момент вызова"; fail=1; }
+B=$(ls "$T"/root/*.tgz 2>/dev/null | head -1)
+if [ -n "$B" ] && [ -s "$B" ]; then
+  echo "  ✓ бандл собран: $(basename "$B")"
+  tar -tzf "$B" >/dev/null 2>&1 && echo "  ✓ это валидный tar.gz" || { echo "  ⚠ архив битый"; fail=1; }
+else
+  echo "  ⚠ бандл не создан"; fail=1
+fi
+
+echo
+echo "=== все функции диспетчера определены до вызова ==="
+for f in cmd_check cmd_panel cmd_cert_export menu install_node; do
+  # Определение должно идти на верхнем уровне, а не быть вложенным в другую
+  # функцию: проверяем, что строка начинается с самого начала строки.
+  grep -qE "^$f\(\) \{" "$S" && echo "  ✓ $f" || { echo "  ⚠ $f не на верхнем уровне"; fail=1; }
+done
+
+echo
 [ "$fail" = "0" ] && echo "ВСЕ ПРОВЕРКИ ПРОШЛИ" || echo "ЕСТЬ ПРОБЛЕМЫ"
 rm -rf "$T"
 exit $fail

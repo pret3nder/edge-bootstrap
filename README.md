@@ -38,9 +38,12 @@ download before replacing the command, so a truncated fetch cannot leave a broke
 behind.
 
 If another installer already claims `rr` as a shell alias, that alias wins over `PATH`
-and typing `rr` runs the other tool. The script reads the shell rc files to detect this
-— aliases are invisible from a non-interactive shell — and prints the full path plus
-the command to find the alias, rather than claiming an install that does not work.
+and typing `rr` runs the other tool. Aliases are invisible from a non-interactive shell,
+so the rc files are read directly. An alias pointing at a command that no longer exists
+is removed, with a backup — that is the common case, since the alias outlives the tool
+that wrote it, and it leaves `rr` answering "command not found" on the one node that
+needs it. An alias whose target still exists is left alone and reported, with the full
+path to use instead.
 
 ## Health check
 
@@ -70,7 +73,8 @@ Every setup pass now handles all four, and installs `remnanode-up.timer`, which 
 `docker compose up -d` two minutes after boot and every five minutes after that.
 That command does nothing when everything is already running, and brings back whatever
 is not. `rr check` reports all three states, so a node that would not survive a reboot
-is visible before it reboots.
+is visible before it reboots — and says so out loud when `/var/run/reboot-required` is
+present, which is exactly the moment the whole thing gets tested for real.
 
 `rr up` applies the same work on demand and starts the containers:
 
@@ -131,6 +135,11 @@ a newer release is verified.
 8. **Makes the node stay up** — enables the docker daemon at boot, raises the restart
    policy in the compose file *and* on the containers that already exist, and installs
    a watchdog timer. See below.
+9. **Clears a dead `rr` alias.** Another installer can own the name as a shell alias,
+   and an alias beats `PATH`. The alias usually outlives the tool it points at, so
+   typing `rr` answers "command not found" on the one node where it is needed. If the
+   target is gone the line is removed, with a backup; if it still exists it is left
+   alone and reported.
 
 ## Masquerade site
 

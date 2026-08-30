@@ -38,6 +38,7 @@ NODE_IMAGE="remnawave/node:2.8.0"     # core version verified after start
 XRAY_EXPECT="26.6.27"
 PANEL_IP="${PANEL_IP:-}"          # see detect_panel_ip
 DIR="/opt/remnanode"
+REBOOT_FLAG=/var/run/reboot-required   # apt writes this; /run is the same path
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
@@ -121,6 +122,33 @@ cmd_check() {
   else
     ylw "  watchdog timer: not installed - rr up adds it"
     warns=$((warns + 1))
+  fi
+
+  # A pending reboot is the moment all of the above gets tested for real. The
+  # node that prompted this check had one waiting, was rebooted, and stayed down.
+  if [ -f "$REBOOT_FLAG" ]; then
+    if systemctl is-enabled docker >/dev/null 2>&1; then
+      ylw "  reboot pending - autostart is in place, the node should come back"
+    else
+      red "  reboot pending AND docker is not enabled - the node will NOT come back"
+      fails=$((fails + 1))
+    fi
+  fi
+
+  # An alias beats PATH, so 'rr' can silently be someone else's tool - or, more
+  # often, a dead pointer left by an installer that is no longer on the host.
+  out=$(alias_line)
+  if [ -n "$out" ]; then
+    if command -v "$(alias_target "$out")" >/dev/null 2>&1; then
+      ylw "  shell alias: $out"
+      ylw "         'rr' runs that, not this script - use /usr/local/bin/rr"
+      warns=$((warns + 1))
+    else
+      red "  shell alias: $out"
+      red "         it points at a command that is gone, so 'rr' just fails"
+      red "         fix: rr up   (removes a dead alias)"
+      fails=$((fails + 1))
+    fi
   fi
 
   # Docker cannot restart anything onto a full disk, and json-file logs are the
@@ -430,6 +458,52 @@ TIMER
   fi
 }
 
+# Another installer can own the name `rr` as a shell alias, and an alias beats
+# $PATH. Worse, the alias outlives the tool it points at: on an adopted node it
+# resolved to remnawave_reverse, which was long gone, so typing rr answered
+# "command not found" and the copy in /usr/local/bin never ran. The operator then
+# has no working entry point on the one node that needs it.
+# A dead alias is removed. A live one is left alone and reported - something else
+# on the host may still use it.
+RC_FILES="/etc/bash.bashrc /root/.bashrc /etc/profile.d/*.sh"
+
+alias_line() {
+  grep -rhoE "^[[:space:]]*alias[[:space:]]+rr=.*" \
+    $RC_FILES "$HOME/.bashrc" "$HOME/.bash_aliases" 2>/dev/null | head -1 || true
+}
+
+# The command an "alias rr=..." line points at, stripped of quotes and arguments.
+alias_target() {
+  printf '%s' "$1" | sed -E "s/^[^=]*=//; s/^['\"]//; s/['\"][[:space:]]*\$//" | awk '{print $1}'
+}
+
+fix_rr_alias() {
+  local f line target found=0
+
+  for f in $RC_FILES "$HOME/.bashrc" "$HOME/.bash_aliases"; do
+    [ -f "$f" ] || continue
+    line=$(grep -m1 -E "^[[:space:]]*alias[[:space:]]+rr=" "$f" 2>/dev/null || true)
+    [ -n "$line" ] || continue
+    found=1
+    target=$(alias_target "$line")
+
+    if [ -n "$target" ] && command -v "$target" >/dev/null 2>&1; then
+      ylw "  alias: 'rr' is aliased to $target in $f, and that command exists"
+      ylw "         leaving it alone - call this one by full path: /usr/local/bin/rr"
+      continue
+    fi
+
+    cp "$f" "$f.bak-rr-$(date +%F)" 2>/dev/null || true
+    sed -i -E "/^[[:space:]]*alias[[:space:]]+rr=/d" "$f"
+    grn "  alias: removed a dead 'rr' alias from $f (pointed at ${target:-nothing})"
+  done
+
+  # The alias is already loaded in the caller's shell; the edited file only
+  # affects the next one.
+  [ "$found" = "1" ] && ylw "         in this shell:  unalias rr; hash -r"
+  return 0
+}
+
 # Bring the node back up, and make sure it can do that by itself next time.
 # Deliberately no "compose pull": a floating tag would change the core.
 cmd_up() {
@@ -438,6 +512,7 @@ cmd_up() {
   echo
   ylw "=== bringing the node up ==="
   ensure_autostart
+  fix_rr_alias
   cd "$DIR"
   docker compose up -d || die "docker compose up failed - see the output above"
   sleep 2
@@ -599,7 +674,8 @@ fi
 # reaches for a function that is not there - which reads as
 # "line 424: cmd_cert_export: command not found" and blames the wrong thing.
 # Seen in the field. Check up front and say what is actually wrong.
-for _f in cmd_check cmd_panel cmd_cert_export cmd_up ensure_autostart menu install_node; do
+for _f in cmd_check cmd_panel cmd_cert_export cmd_up ensure_autostart fix_rr_alias \
+          alias_line alias_target menu install_node; do
   declare -F "$_f" >/dev/null 2>&1 || die "this copy of the script is incomplete: $_f is missing.
   It parsed, so the download was cut at a point that happens to be valid syntax.
   Replace it:
@@ -1527,16 +1603,15 @@ if [ "${RR_READY:-0}" = "1" ]; then
   # aliases are not visible from a non-interactive shell, so the rc files are
   # read directly rather than asking the shell. Without this the script would
   # report "installed as rr" while typing rr ran something else entirely.
-  RRA=$(grep -rhoE "^[[:space:]]*alias[[:space:]]+rr=.*" \
-        "$HOME/.bashrc" "$HOME/.bash_aliases" /root/.bashrc /etc/bash.bashrc \
-        /etc/profile.d/*.sh 2>/dev/null | head -1 || true)
+  fix_rr_alias
+  RRA=$(alias_line)
   RRP=$(command -v rr 2>/dev/null || true)
   if [ -n "$RRA" ]; then
-    ylw "Installed at /usr/local/bin/rr, but 'rr' is a shell alias on this host:"
+    # Still there after fix_rr_alias, so it points at a command that exists.
+    ylw "Installed at /usr/local/bin/rr, but 'rr' is a live alias on this host:"
     ylw "  $RRA"
-    ylw "An alias wins over PATH, so use the full path or remove it:"
+    ylw "An alias wins over PATH, so call this one by its full path:"
     echo "  /usr/local/bin/rr $DOMAIN"
-    echo "  grep -rn 'alias rr=' ~/.bashrc ~/.bash_aliases /etc/profile.d/ 2>/dev/null"
   elif [ -n "$RRP" ] && [ "$RRP" != "/usr/local/bin/rr" ]; then
     ylw "Installed at /usr/local/bin/rr, but another rr comes first in PATH: $RRP"
     echo "  run it as:  /usr/local/bin/rr $DOMAIN"

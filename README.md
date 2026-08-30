@@ -28,6 +28,7 @@ just:
 rr                    # menu
 rr node.example.com   # set up or reconfigure
 rr check              # health check, read-only
+rr up                 # start the containers and make them stay up
 rr panel              # print the saved panel values again
 rr cert-export        # pack the certificate for the other nodes
 ```
@@ -50,6 +51,35 @@ mount still names the domain the node serves, firewall state and exposed ports, 
 actually listening locally, and the presence of the static site the SPA fallback needs.
 
 It changes nothing, so it is safe on a live node.
+
+## Staying up
+
+A node went down and stayed down, so `restart: always` in the compose file is treated as
+necessary but not sufficient. Four things have to hold, and none of them is visible while
+the containers happen to be running:
+
+- the docker daemon has to be enabled at boot — a node installed by someone else's script
+  may never have had that done;
+- the compose file has to carry the policy, and a file written elsewhere may carry a
+  weaker one (`unless-stopped`, `on-failure`, `no`);
+- the policy belongs to the container, not to the file, so editing the file changes
+  nothing until the container is recreated;
+- a container that was *removed* is not restarted by any policy at all.
+
+Every setup pass now handles all four, and installs `remnanode-up.timer`, which runs
+`docker compose up -d` two minutes after boot and every five minutes after that.
+That command does nothing when everything is already running, and brings back whatever
+is not. `rr check` reports all three states, so a node that would not survive a reboot
+is visible before it reboots.
+
+`rr up` applies the same work on demand and starts the containers:
+
+```bash
+rr up
+```
+
+It deliberately does not run `docker compose pull` — on a compose still pointing at a
+floating tag that would swap the core underneath the node.
 
 ## Bare server
 
@@ -98,6 +128,9 @@ a newer release is verified.
    (`chrome`/`firefox`/`safari`/`edge`), which the core expands into a full matching
    header set, and it is read from the same variable as the REALITY fingerprint so the
    two cannot disagree.
+8. **Makes the node stay up** — enables the docker daemon at boot, raises the restart
+   policy in the compose file *and* on the containers that already exist, and installs
+   a watchdog timer. See below.
 
 ## Masquerade site
 

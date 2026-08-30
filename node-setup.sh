@@ -6,6 +6,12 @@
 # Anything not supplied on the command line is asked for interactively;
 # with no controlling terminal the script fails with a clear message instead.
 #
+# Sub-commands:
+#   check         read-only health check
+#   up            start the containers and make them come back on their own
+#   panel         re-print the values this node needs in the panel
+#   cert-export   pack this node's certificate for the rest of the fleet
+#
 # Options:
 #   --panel-ip <IP>   panel address for the NODE_PORT rule (auto-detected by default)
 #   --email <addr>    e-mail for the Let's Encrypt account (first registration only)
@@ -22,6 +28,7 @@
 #   5. firewall: only 80 and 443 tcp+udp exposed; NODE_PORT restricted to the panel IP
 #   6. issues the certificate if missing and clears ones left from a previous domain
 #   7. generates keys and writes a ready-to-paste config profile and host values to a file
+#   8. makes the containers survive a reboot and come back by themselves if they stop
 #
 # Inbounds: XHTTP-REALITY (443/tcp) and Hysteria2 (443/udp).
 # VLESS-PQ and HTTPUpgrade are intentionally omitted: extra listening ports add no value here.
@@ -66,7 +73,7 @@ ask() {
 # Read-only: it never changes anything.
 # ---------------------------------------------------------------------------
 cmd_check() {
-  local d="${1:-}" fails=0 warns=0 v st out days
+  local d="${1:-}" fails=0 warns=0 v st out days pol
 
   # Domain: take the argument, else read it back from the running nginx config.
   if [ -z "$d" ] && [ -f "$DIR/nginx.conf" ]; then
@@ -87,6 +94,45 @@ cmd_check() {
       fails=$((fails + 1))
     fi
   done
+
+  # --- autostart ------------------------------------------------------------
+  # A node has gone down and stayed down. Three separate things have to hold,
+  # and none of them is visible while the containers happen to be running.
+  if systemctl is-enabled docker >/dev/null 2>&1; then
+    grn "  docker service: enabled at boot"
+  else
+    red "  docker service: NOT enabled at boot - nothing returns after a reboot"
+    red "         fix: rr up"
+    fails=$((fails + 1))
+  fi
+  for c in remnanode remnawave-nginx; do
+    pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2>/dev/null || true)
+    [ -z "$pol" ] && continue          # container missing, already reported above
+    if [ "$pol" = "always" ]; then
+      grn "  restart policy $c: always"
+    else
+      red "  restart policy $c: $pol, expected always"
+      red "         fix: rr up"
+      fails=$((fails + 1))
+    fi
+  done
+  if systemctl is-enabled remnanode-up.timer >/dev/null 2>&1; then
+    grn "  watchdog timer: armed"
+  else
+    ylw "  watchdog timer: not installed - rr up adds it"
+    warns=$((warns + 1))
+  fi
+
+  # Docker cannot restart anything onto a full disk, and json-file logs are the
+  # usual reason it fills up on a node that has nothing else on it.
+  out=$(df -P /var/lib/docker 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}' || true)
+  if [ -n "$out" ] && [ "$out" -ge 90 ] 2>/dev/null; then
+    red "  disk under /var/lib/docker: ${out}% used"
+    fails=$((fails + 1))
+  elif [ -n "$out" ] && [ "$out" -ge 75 ] 2>/dev/null; then
+    ylw "  disk under /var/lib/docker: ${out}% used"
+    warns=$((warns + 1))
+  fi
 
   # --- core version ---------------------------------------------------------
   # A floating tag has twice pulled a core where XHTTP over REALITY is broken:
@@ -238,16 +284,18 @@ menu() {
     printf '    2) health check\n' >/dev/tty
     printf '    3) show panel values\n' >/dev/tty
     printf '    4) export certificate bundle for other nodes\n' >/dev/tty
+    printf '    5) bring the containers back up\n' >/dev/tty
     printf '    0) exit\n' >/dev/tty
     printf '  choice: ' >/dev/tty
     read -r choice </dev/tty || return 1
     case "$choice" in
       1) ACTION=setup; return 0 ;;
       2) ACTION=check; return 0 ;;
+      5) ACTION=up; return 0 ;;
       3) ACTION=panel; return 0 ;;
       4) ACTION=cert-export; return 0 ;;
       0) exit 0 ;;
-      *) red "  pick 0-4" >/dev/tty ;;
+      *) red "  pick 0-5" >/dev/tty ;;
     esac
   done
 }
@@ -285,6 +333,122 @@ install_prereqs() {
   fi
 
   systemctl enable --now docker >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Keep the node up on its own.
+#
+# "restart: always" in the compose file is not enough, and a node has already
+# gone down and stayed down:
+#   - the docker daemon may not be enabled at boot, so nothing returns after a
+#     reboot. install_prereqs enables it, but that only runs on a bare-metal
+#     install - a node from the stock installer never passes through it;
+#   - a compose written by someone else may carry a weaker policy;
+#   - the policy is a property of the container, so a file edit does nothing
+#     until the container is recreated;
+#   - a container that was removed is not restarted by any policy at all.
+#
+# All four are handled here, and a timer running "compose up -d" at boot and
+# every five minutes is the backstop. That command is a no-op when everything
+# is already running.
+# ---------------------------------------------------------------------------
+AUTOSTART_UNIT=/etc/systemd/system/remnanode-up.service
+AUTOSTART_TIMER=/etc/systemd/system/remnanode-up.timer
+
+ensure_autostart() {
+  local c pol
+
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  systemctl enable containerd   >/dev/null 2>&1 || true
+
+  # A weaker policy in the file: raise it. If there is no restart line at all,
+  # the file is not ours and its layout is unknown - inserting into arbitrary
+  # YAML is riskier than leaving it to the timer below.
+  # The delimiter is @, not |: the alternation below contains | and would end
+  # the s-expression early. sed then dies with "unknown option to `s'".
+  if [ -f "$DIR/docker-compose.yml" ] &&
+     grep -qE '^[[:space:]]*restart:[[:space:]]*["'"'"']?(no|unless-stopped|on-failure)' "$DIR/docker-compose.yml"; then
+    sed -i -E 's@^([[:space:]]*)restart:[[:space:]]*["'"'"']?(no|unless-stopped|on-failure(:[0-9]+)?)["'"'"']?[[:space:]]*$@\1restart: always@' \
+        "$DIR/docker-compose.yml"
+    chmod 600 "$DIR/docker-compose.yml" 2>/dev/null || true
+    grn "  autostart: restart policy raised to always in docker-compose.yml"
+  fi
+
+  for c in remnanode remnawave-nginx; do
+    docker inspect "$c" >/dev/null 2>&1 || continue
+    pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2>/dev/null || true)
+    [ "$pol" = "always" ] && continue
+    docker update --restart=always "$c" >/dev/null 2>&1 &&
+      grn "  autostart: $c policy ${pol:-none} -> always"
+  done
+
+  # No systemd, or no unit directory: skip the watchdog rather than let a failed
+  # redirect kill the whole run under set -e. The policy work above still stands.
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d "${AUTOSTART_UNIT%/*}" ]; then
+    ylw "  autostart: no systemd unit directory here - watchdog not installed"
+    return 0
+  fi
+
+  cat > "$AUTOSTART_UNIT" <<UNIT
+[Unit]
+Description=Bring up the Remnawave node containers
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$DIR
+ExecStart=/bin/sh -c 'docker compose up -d'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # No RemainAfterExit: the unit must be inactive when it finishes, otherwise
+  # the timer would find it already active and never run it again.
+  cat > "$AUTOSTART_TIMER" <<'TIMER'
+[Unit]
+Description=Keep the Remnawave node containers up
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable remnanode-up.service >/dev/null 2>&1 || true
+  systemctl enable --now remnanode-up.timer >/dev/null 2>&1 || true
+  if systemctl is-enabled remnanode-up.timer >/dev/null 2>&1; then
+    grn "  autostart: watchdog armed - boot, then every 5 minutes"
+  else
+    ylw "  autostart: could not arm the watchdog timer - is this systemd?"
+  fi
+}
+
+# Bring the node back up, and make sure it can do that by itself next time.
+# Deliberately no "compose pull": a floating tag would change the core.
+cmd_up() {
+  local c st
+  [ -f "$DIR/docker-compose.yml" ] || die "no node in $DIR - run a setup pass first"
+  echo
+  ylw "=== bringing the node up ==="
+  ensure_autostart
+  cd "$DIR"
+  docker compose up -d || die "docker compose up failed - see the output above"
+  sleep 2
+  for c in remnanode remnawave-nginx; do
+    st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+    if [ "$st" = "running" ]; then grn "  $c: running"
+    else
+      red "  $c: $st"
+      docker logs --tail 5 "$c" 2>&1 | sed 's/^/      /'
+    fi
+  done
 }
 
 install_node() {
@@ -376,7 +540,7 @@ cmd_cert_export() {
 # First positional argument is either a sub-command or the domain.
 ACTION=setup
 case "${1:-}" in
-  check|panel|setup) ACTION="$1"; shift ;;
+  check|panel|setup|up) ACTION="$1"; shift ;;
   cert-export)       ACTION=cert-export; shift ;;
   menu)              ACTION=menu; shift ;;
 esac
@@ -435,7 +599,7 @@ fi
 # reaches for a function that is not there - which reads as
 # "line 424: cmd_cert_export: command not found" and blames the wrong thing.
 # Seen in the field. Check up front and say what is actually wrong.
-for _f in cmd_check cmd_panel cmd_cert_export menu install_node; do
+for _f in cmd_check cmd_panel cmd_cert_export cmd_up ensure_autostart menu install_node; do
   declare -F "$_f" >/dev/null 2>&1 || die "this copy of the script is incomplete: $_f is missing.
   It parsed, so the download was cut at a point that happens to be valid syntax.
   Replace it:
@@ -444,6 +608,7 @@ done
 
 case "$ACTION" in
   check) cmd_check "$DOMAIN"; exit 0 ;;
+  up)    cmd_up; exit 0 ;;
   panel) cmd_panel "$DOMAIN"; exit $? ;;
   cert-export) cmd_cert_export "$DOMAIN"; exit 0 ;;
 esac
@@ -1140,6 +1305,7 @@ fi
 cd "$DIR"
 docker compose pull >/dev/null 2>&1 || true
 docker compose up -d --force-recreate >/dev/null
+ensure_autostart
 V=""
 for _ in $(seq 1 15); do
   V=$(docker logs remnanode 2>&1 | grep -a -m1 "Xray version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)

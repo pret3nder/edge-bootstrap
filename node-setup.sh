@@ -11,6 +11,9 @@
 #   up            start the containers and make them come back on their own
 #   panel         re-print the values this node needs in the panel
 #   cert-export   pack this node's certificate for the rest of the fleet
+#   firewall      open the ports the node serves, close the rest, arm a 5-minute sync
+#                 (--dry-run: show the plan only; --auto: what the timer runs)
+#                 Touches nothing but ufw - safe on a live node, keys stay as they are.
 #
 # Options:
 #   --panel-ip <IP>   panel address for the NODE_PORT rule (auto-detected by default)
@@ -25,16 +28,18 @@
 #   2. mounts /etc/letsencrypt into remnanode (Hysteria2 reads the certificate directly)
 #   3. writes a hardened nginx config (server_tokens off, probe-404, SPA fallback, access_log off)
 #   4. installs a small static site, deterministically different per domain
-#   5. firewall: only 80 and 443 tcp+udp exposed; NODE_PORT restricted to the panel IP
+#   5. firewall: 80, 443 tcp+udp and whatever the core serves; NODE_PORT only from the panel IP;
+#      everything else closed, and kept that way by a timer as inbounds change in the panel
 #   6. issues the certificate if missing and clears ones left from a previous domain
 #   7. generates keys and writes a ready-to-paste config profile and host values to a file
 #   8. makes the containers survive a reboot and come back by themselves if they stop
 #
-# Inbounds: XHTTP-REALITY (443/tcp) and Hysteria2 (443/udp).
-# VLESS-PQ and HTTPUpgrade are intentionally omitted: extra listening ports add no value here.
+# Inbounds: XHTTP-REALITY (443/tcp), Hysteria2 (443/udp), VLESS raw+REALITY+Vision (2083/tcp).
+# VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted.
 set -euo pipefail
 
 NODE_IMAGE="remnawave/node:2.8.0"     # core version verified after start
+REALITY_TCP_PORT=2083                 # VLESS raw+REALITY; 443/tcp belongs to XHTTP
 XRAY_EXPECT="26.6.27"
 PANEL_IP="${PANEL_IP:-}"          # see detect_panel_ip
 DIR="/opt/remnanode"
@@ -74,7 +79,7 @@ ask() {
 # Read-only: it never changes anything.
 # ---------------------------------------------------------------------------
 cmd_check() {
-  local d="${1:-}" fails=0 warns=0 v st out days pol
+  local d="${1:-}" fails=0 warns=0 v st out days pol fwplan
 
   # Domain: take the argument, else read it back from the running nginx config.
   if [ -z "$d" ] && [ -f "$DIR/nginx.conf" ]; then
@@ -229,12 +234,27 @@ cmd_check() {
   # --- firewall -------------------------------------------------------------
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     grn "  firewall: active"
-    for p in 2053 8443; do
-      if ufw status 2>/dev/null | grep -qE "(^|[^0-9])$p([^0-9]|\$)"; then
-        ylw "  firewall: a rule for $p is still present"
-        warns=$((warns + 1))
-      fi
-    done
+    # The same plan rr firewall would carry out, without carrying it out.
+    detect_panel_ip || true
+    fwplan=$(fw_sync dry 2>&1 || true)
+    printf '%s
+' "$fwplan"
+    if printf '%s
+' "$fwplan" | grep -q "would open"; then
+      red "  firewall: a served port is closed - clients cannot reach it (fix: rr firewall)"
+      fails=$((fails + 1))
+    fi
+    if printf '%s
+' "$fwplan" | grep -q "would close"; then
+      ylw "  firewall: ports open that nothing serves (fix: rr firewall)"
+      warns=$((warns + 1))
+    fi
+    if systemctl is-enabled remnanode-fw.timer >/dev/null 2>&1; then
+      grn "  firewall: automatic sync timer armed"
+    else
+      ylw "  firewall: automatic sync timer not armed (rr firewall arms it)"
+      warns=$((warns + 1))
+    fi
     if ufw status 2>/dev/null | grep -qE '2222.*(Anywhere|0\.0\.0\.0)'; then
       red "  firewall: NODE_PORT is open to the internet - it identifies the node to anyone scanning"
       fails=$((fails + 1))
@@ -249,9 +269,6 @@ cmd_check() {
   # edge on every port, which makes a remote probe look wrong.
   out=$(ss -ltn 2>/dev/null | awk 'NR>1 {n=split($4,a,":"); print a[n]}' | sort -un | tr '\n' ' ' || true)
   echo "  listening tcp: ${out:-none}"
-  for p in 2053 8443; do
-    case " $out " in *" $p "*) ylw "  listening: $p is still bound - the panel profile still has that inbound"; warns=$((warns + 1)) ;; esac
-  done
   case " $out " in *" 2222 "*) grn "  node port 2222: listening" ;; *) red "  node port 2222: not listening - the panel cannot reach this node"; fails=$((fails + 1)) ;; esac
 
   # --- site -----------------------------------------------------------------
@@ -313,6 +330,7 @@ menu() {
     printf '    3) show panel values\n' >/dev/tty
     printf '    4) export certificate bundle for other nodes\n' >/dev/tty
     printf '    5) bring the containers back up\n' >/dev/tty
+    printf '    6) sync the firewall with what the node serves\n' >/dev/tty
     printf '    0) exit\n' >/dev/tty
     printf '  choice: ' >/dev/tty
     read -r choice </dev/tty || return 1
@@ -322,8 +340,9 @@ menu() {
       5) ACTION=up; return 0 ;;
       3) ACTION=panel; return 0 ;;
       4) ACTION=cert-export; return 0 ;;
+      6) ACTION=firewall; return 0 ;;
       0) exit 0 ;;
-      *) red "  pick 0-5" >/dev/tty ;;
+      *) red "  pick 0-6" >/dev/tty ;;
     esac
   done
 }
@@ -612,11 +631,264 @@ cmd_cert_export() {
   echo
   echo "  Renewal stays on this host. Re-export and re-import before expiry."
 }
+# ---------------------------------------------------------------------------
+# Firewall follows what the node actually serves.
+#
+# The inbound set lives in the panel, not on this host: a port appears when an
+# inbound is added to the profile and disappears when it is removed. A fixed
+# allow-list in this script went stale twice (a new inbound stayed unreachable,
+# a removed one stayed open). So the open set is derived from the sockets:
+#   - the base layout (80/tcp, 443/tcp, 443/udp) and every public socket of
+#     xray, nginx and sshd, per protocol;
+#   - NODE_PORT (2222) only from the panel address;
+#   - nothing else. Rules open to Anywhere for other ports are removed.
+# A port that nginx proxies to on the loopback is internal even if xray binds
+# it on 0.0.0.0 (the CDN node), and is not opened.
+#
+# Safety:
+#   - no public xray socket at all (restart, profile not pushed yet): only opens;
+#   - --auto (the timer) closes a port only when it was unused on the previous
+#     run too, so a core restart between two checks cannot take a port down;
+#   - a rule that covers an SSH port is never deleted;
+#   - rules limited to a source address are left alone, except NODE_PORT ones
+#     that are not the panel.
+# ---------------------------------------------------------------------------
+NODE_PORT=2222
+FW_STATE_DIR=/var/lib/rr
+# The node layout this script sets up: ACME/redirect on 80, XHTTP+REALITY on
+# 443/tcp, Hysteria2 on 443/udp, VLESS raw+REALITY on 2083/tcp. Kept open even before the core is up - certbot needs 80
+# during a first install, and the containers start only after this step.
+FW_BASE="80/tcp 443/tcp 443/udp $REALITY_TCP_PORT/tcp"
+FW_UNIT=/etc/systemd/system/remnanode-fw.service
+FW_TIMER=/etc/systemd/system/remnanode-fw.timer
+
+# port/proto of public sockets owned by the given process names, one per line
+fw_listeners() {                       # fw_listeners <name|name|...>
+  ss -Hlntup 2>/dev/null | awk -v want="$1" '
+    {
+      proto = $1; loc = $5; n = split(loc, a, ":"); port = a[n]
+      addr = substr(loc, 1, length(loc) - length(port) - 1)
+      if (port !~ /^[0-9]+$/) next
+      if (addr ~ /^127\./ || addr ~ /^\[?::1\]?$/ || addr ~ /%lo$/ || addr ~ /^\[::ffff:127\./) next
+      if (!match($0, "\"(" want ")\"")) next
+      print port "/" (proto == "udp" ? "udp" : "tcp")
+    }' | sort -u
+}
+
+# ports nginx forwards to on the loopback - internal by construction
+fw_internal_ports() {
+  [ -f "$DIR/nginx.conf" ] || return 0
+  grep -oE 'proxy_pass[[:space:]]+(https?|grpc)://(127\.0\.0\.1|localhost|\[::1\]):[0-9]+' "$DIR/nginx.conf" 2>/dev/null |
+    sed -E 's/.*:([0-9]+)$/\1/' | sort -u || true
+}
+
+# Expands the "To" column of a ufw rule into port/proto items, one per line.
+# Prints nothing for application profiles ("OpenSSH") - those are left alone.
+fw_rule_items() {                      # fw_rule_items "443,2222/tcp" | "80" | "20000:20010/udp"
+  local spec="$1" ports proto p a b
+  case "$spec" in */tcp|*/udp) proto="${spec##*/}"; ports="${spec%/*}" ;; *) proto=""; ports="$spec" ;; esac
+  printf '%s' "$ports" | grep -qE '^[0-9,:]+$' || return 0
+  for p in $(printf '%s' "$ports" | tr ',' ' '); do
+    case "$p" in
+      *:*) a="${p%:*}"; b="${p#*:}"
+           # a range is judged by its bounds; enumerating thousands of ports buys nothing
+           for x in "$a" "$b"; do
+             [ -z "$proto" ] || [ "$proto" = tcp ] && echo "$x/tcp"
+             [ -z "$proto" ] || [ "$proto" = udp ] && echo "$x/udp"
+           done ;;
+      *)   [ -z "$proto" ] || [ "$proto" = tcp ] && echo "$p/tcp"
+           [ -z "$proto" ] || [ "$proto" = udp ] && echo "$p/udp" ;;
+    esac
+  done
+  return 0
+}
+
+# "N|to|from" for every ALLOW IN rule, numbered as ufw numbers them right now
+fw_rules() {
+  ufw status numbered 2>/dev/null | sed -E 's/[[:space:]]+#.*$//' | awk '
+    /^\[[ 0-9]+\]/ && /ALLOW IN/ {
+      n = $0; sub(/^\[[ ]*/, "", n); sub(/\].*/, "", n)
+      line = $0; sub(/^\[[ 0-9]+\][ ]*/, "", line)
+      split(line, parts, /[ ]+ALLOW IN[ ]+/)
+      to = parts[1]; from = parts[2]
+      sub(/[ ]*\(v6\)$/, "", to); sub(/[ ]*\(v6\)$/, "", from)
+      print n "|" to "|" from
+    }'
+}
+
+# Membership test on a word list. Not grep -q in a pipe: grep leaves on the first
+# match, the writer gets SIGPIPE, and under pipefail the test reads as false.
+fw_in() { case " $(echo $2) " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# port/proto items covered by rules from the given source ("Anywhere" or an address)
+fw_open_items() {                      # fw_open_items <from>
+  local x
+  fw_rules | awk -F'|' -v f="$1" '($3 == f) || (f == "Anywhere" && $3 ~ /^Anywhere/) {print $2}' |
+    while IFS= read -r x; do fw_rule_items "$x"; done
+}
+
+fw_sync() {                            # fw_sync [dry|auto|apply]
+  local mode="${1:-apply}" wanted internal ssh_items xray_n state absent_prev absent_now
+  local closes="" deleted=0 opened=0 kept="" x n to from items item bad open_any
+  command -v ufw >/dev/null 2>&1 || { ylw "  firewall: ufw not found - open the ports by hand"; return 0; }
+  command -v ss  >/dev/null 2>&1 || { ylw "  firewall: ss not found - cannot tell what is listening, nothing changed"; return 0; }
+
+  internal=$(fw_internal_ports)
+  ssh_items=$(fw_listeners 'sshd')
+  [ -n "$ssh_items" ] || ssh_items="22/tcp"
+  wanted=$( { fw_listeners 'xray|nginx'; printf '%s\n' $FW_BASE $ssh_items; } | sort -u | while read -r x; do
+              [ -n "$x" ] || continue
+              fw_in "${x%/*}" "$internal" && continue
+              [ "${x%/*}" = "$NODE_PORT" ] && continue
+              echo "$x"
+            done)
+  xray_n=$(fw_listeners 'xray' | grep -c . || true)
+  echo "  firewall: serving  $(echo $wanted)"
+  [ -z "$internal" ] || echo "  firewall: internal $(echo $internal) (behind nginx, not opened)"
+
+  state="$FW_STATE_DIR/fw-unused"
+  # first run: no state file yet - under pipefail a bare cat would end the script
+  absent_prev=" $( { cat "$state" 2>/dev/null || true; } | tr '\n' ' ') "
+  absent_now=""
+
+  # One pass over the rules decides what goes. Rules are matched later by their
+  # text, not their number: numbers shift after every delete, and the v6 twin of
+  # a rule has the same text and goes with it.
+  while IFS='|' read -r n to from; do
+    [ -n "$to" ] || continue
+    items=$(fw_rule_items "$to")
+    [ -n "$items" ] || continue
+    for item in $items; do fw_in "$item" "$ssh_items" && continue 2; done
+    case "$from" in
+      Anywhere*) ;;
+      *) if fw_in "$NODE_PORT/tcp" "$items" && [ -n "${PANEL_IP:-}" ] && [ "$from" != "$PANEL_IP" ]; then
+           closes="$closes$to|$from
+"
+         else
+           case "$kept" in *"[$to from $from]"*) ;; *) kept="$kept [$to from $from]" ;; esac
+         fi
+         continue ;;
+    esac
+    bad=""
+    for item in $items; do fw_in "$item" "$wanted" || bad="$bad $item"; done
+    [ -n "$bad" ] || continue
+    absent_now="$absent_now$bad"
+    if [ "$mode" = auto ]; then
+      for item in $bad; do case "$absent_prev" in *" $item "*) ;; *) continue 2 ;; esac; done
+    fi
+    case "$closes" in *"$to|$from"*) ;; *) closes="$closes$to|$from
+" ;; esac
+  done <<EOF_RULES
+$(fw_rules)
+EOF_RULES
+
+  if [ -n "$closes" ] && [ "$xray_n" -eq 0 ]; then
+    ylw "  firewall: xray has no public socket (restarting, or no profile yet) - closing skipped"
+    closes=""
+  fi
+  while IFS='|' read -r to from; do
+    [ -n "$to" ] || continue
+    if [ "$mode" = dry ]; then echo "  firewall: would close $to (from $from)"; continue; fi
+    for _ in 1 2 3 4; do               # the rule and its v6 twin, with room to spare
+      n=$(fw_rules | awk -F'|' -v t="$to" -v f="$from" '$2 == t && $3 == f {print $1; exit}')
+      [ -n "$n" ] || break
+      ufw --force delete "$n" >/dev/null 2>&1 || { red "  firewall: could not delete rule $to"; break; }
+      deleted=$((deleted + 1))
+    done
+    grn "  firewall: closed $to (from $from)"
+  done <<EOF_CLOSE
+$closes
+EOF_CLOSE
+
+  # Open what is served but not allowed from Anywhere.
+  open_any=$(fw_open_items Anywhere)
+  for item in $wanted; do
+    fw_in "$item" "$open_any" && continue
+    if [ "$mode" = dry ]; then echo "  firewall: would open $item"; continue; fi
+    if ufw allow "$item" comment 'rr: served' >/dev/null 2>&1; then
+      opened=$((opened + 1)); grn "  firewall: opened $item"
+    else
+      red "  firewall: could not open $item"
+    fi
+  done
+
+  if [ -n "${PANEL_IP:-}" ]; then
+    if ! fw_in "$NODE_PORT/tcp" "$(fw_open_items "$PANEL_IP")"; then
+      if [ "$mode" = dry ]; then
+        echo "  firewall: would allow $NODE_PORT/tcp from $PANEL_IP"
+      elif ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp >/dev/null 2>&1; then
+        opened=$((opened + 1)); grn "  firewall: $NODE_PORT/tcp allowed from $PANEL_IP"
+      fi
+    fi
+  else
+    ylw "  firewall: panel address unknown - $NODE_PORT rules left as they are (pass --panel-ip)"
+  fi
+
+  if [ "$mode" != dry ]; then
+    [ $((deleted + opened)) -eq 0 ] || ufw reload >/dev/null 2>&1 || true
+    { mkdir -p "$FW_STATE_DIR" && printf '%s\n' $absent_now > "$state"; } 2>/dev/null || true
+    echo "  firewall: $opened opened, $deleted rule(s) removed"
+  fi
+  [ -z "$kept" ] || echo "  firewall: left alone (source-restricted):$kept"
+  return 0
+}
+
+# The timer re-runs the sync, so an inbound added or removed in the panel
+# reaches the firewall within minutes without anyone logging in.
+ensure_fw_timer() {
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d "${FW_UNIT%/*}" ]; then
+    ylw "  firewall: no systemd unit directory - automatic sync not installed"
+    return 0
+  fi
+  cat > "$FW_UNIT" <<'UNIT'
+[Unit]
+Description=Sync ufw with the ports the Remnawave node serves
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ -x /usr/local/bin/rr ] && /usr/local/bin/rr firewall --auto'
+UNIT
+  cat > "$FW_TIMER" <<'TIMER'
+[Unit]
+Description=Keep ufw in step with the node's inbounds
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+TIMER
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now remnanode-fw.timer >/dev/null 2>&1 || true
+  if systemctl is-enabled remnanode-fw.timer >/dev/null 2>&1; then
+    grn "  firewall: automatic sync armed - every 5 minutes"
+  else
+    ylw "  firewall: could not arm the sync timer - is this systemd?"
+  fi
+}
+
+cmd_firewall() {                       # cmd_firewall [dry|auto|apply]
+  local mode="${1:-apply}"
+  detect_panel_ip || true
+  if [ "$mode" != dry ] && ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    ylw "  firewall: ufw was inactive - enabling, SSH first"
+    ufw allow 22/tcp >/dev/null 2>&1 || true
+    ufw --force enable >/dev/null 2>&1 || { red "  firewall: could not enable ufw"; return 1; }
+  fi
+  fw_sync "$mode"
+  [ "$mode" = apply ] && ensure_fw_timer
+  return 0
+}
+
 # First positional argument is either a sub-command or the domain.
 ACTION=setup
 case "${1:-}" in
   check|panel|setup|up) ACTION="$1"; shift ;;
   cert-export)       ACTION=cert-export; shift ;;
+  firewall|fw)       ACTION=firewall; shift ;;
   menu)              ACTION=menu; shift ;;
 esac
 
@@ -624,8 +896,10 @@ CERT_MODE=http
 CERT_MODE_SET=0
 GCORE_TOKEN="${GCORE_API_TOKEN:-}"
 
-DOMAIN="${1:-}"
-[ $# -gt 0 ] && shift
+FW_MODE=apply
+# Options may come first (rr firewall --dry-run): a leading dash is not a domain.
+DOMAIN=""
+case "${1:-}" in -*|"") ;; *) DOMAIN="$1"; shift ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --panel-ip)    shift; PANEL_IP="${1:-}" ;;
@@ -639,6 +913,8 @@ while [ $# -gt 0 ]; do
     --gcore-token) shift; GCORE_TOKEN="${1:-}" ;;
     --cert-bundle) shift; CERT_BUNDLE="${1:-}" ;;
     --apex)        shift; APEX_OVERRIDE="${1:-}" ;;
+    --dry-run)     FW_MODE=dry ;;
+    --auto)        FW_MODE=auto ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -675,7 +951,7 @@ fi
 # "line 424: cmd_cert_export: command not found" and blames the wrong thing.
 # Seen in the field. Check up front and say what is actually wrong.
 for _f in cmd_check cmd_panel cmd_cert_export cmd_up ensure_autostart fix_rr_alias \
-          alias_line alias_target menu install_node; do
+          alias_line alias_target menu install_node cmd_firewall fw_sync ensure_fw_timer; do
   declare -F "$_f" >/dev/null 2>&1 || die "this copy of the script is incomplete: $_f is missing.
   It parsed, so the download was cut at a point that happens to be valid syntax.
   Replace it:
@@ -687,6 +963,7 @@ case "$ACTION" in
   up)    cmd_up; exit 0 ;;
   panel) cmd_panel "$DOMAIN"; exit $? ;;
   cert-export) cmd_cert_export "$DOMAIN"; exit 0 ;;
+  firewall) cmd_firewall "$FW_MODE"; exit $? ;;
 esac
 
 # ---- from here on: setup ----
@@ -1144,42 +1421,13 @@ if command -v ufw >/dev/null; then
     fi
   fi
 
-  # ufw allow only ever adds. Ports left over from an earlier layout stay open unless
-  # their rules are deleted, so anything outside the intended set is dropped first.
-  # Rules are matched by number and re-read every iteration, because deleting one
-  # renumbers the rest. The counter is a guard against a rule that refuses to go away.
-  drop_rules() {                       # drop_rules <extended-regex over the rule text>
-    local re="$1" n guard=0
-    while [ $guard -lt 40 ]; do
-      n=$(ufw status numbered 2>/dev/null | grep -E "$re" | head -1 | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/' || true)
-      [ -n "$n" ] || return 0
-      ufw --force delete "$n" >/dev/null 2>&1 || return 0
-      guard=$((guard + 1))
-    done
-  }
-
-  # ports this layout does not use; also catches multiport rules like "443,2222/tcp"
-  for p in 2053 8443; do
-    drop_rules "^\[[ 0-9]+\].*(^|[^0-9])$p([^0-9]|\$)" && true
-  done
-  # any NODE_PORT rule that is not already limited to the panel
-  drop_rules "^\[[ 0-9]+\].*2222.*(Anywhere|0\.0\.0\.0)"
-
-  ufw allow 22/tcp  >/dev/null 2>&1 || true      # keep SSH reachable no matter what
-  ufw allow 443/tcp >/dev/null
-  ufw allow 443/udp >/dev/null
-  ufw allow 80/tcp  >/dev/null
-  ufw allow from "$PANEL_IP" to any port 2222 proto tcp >/dev/null
-  ufw reload >/dev/null
-
-  STILL=$(ufw status 2>/dev/null | grep -E '(^|[^0-9])(2053|8443)([^0-9]|$)' | head -3 || true)
+  # The open set follows the sockets, not a list kept here - see fw_sync.
+  # SSH goes first so no step below can lock the session out.
+  ufw allow 22/tcp >/dev/null 2>&1 || true
+  fw_sync apply
+  ensure_fw_timer
   if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-    red "  firewall: ufw is still inactive - nothing below is enforced"
-  elif [ -n "$STILL" ]; then
-    ylw "  firewall: these rules survived, remove them by hand:"
-    printf '%s\n' "$STILL" | sed 's/^/           /'
-  else
-    grn "  firewall: active; 22, 80, 443 tcp+udp; 2222 restricted to $PANEL_IP; 2053 and 8443 closed"
+    red "  firewall: ufw is still inactive - nothing above is enforced"
   fi
 else
   ylw "  ufw not found - open the ports manually"
@@ -1452,12 +1700,16 @@ KEYS=$(docker exec remnanode xray x25519 2>/dev/null || true)
 PRIV=$(printf '%s' "$KEYS" | grep -i 'private' | awk '{print $NF}' || true)
 PUB=$(printf '%s' "$KEYS" | grep -i 'public' | awk '{print $NF}' || true)
 SID=$(openssl rand -hex 8)
+# VLESS raw+REALITY (Vision) on its own port gets its own key pair and shortId:
+# one leaked key must not open both inbounds.
+KEYS2=$(docker exec remnanode xray x25519 2>/dev/null || true)
+PRIV2=$(printf '%s' "$KEYS2" | grep -i 'private' | awk '{print $NF}' || true)
+PUB2=$(printf '%s' "$KEYS2" | grep -i 'public' | awk '{print $NF}' || true)
+SID2=$(openssl rand -hex 8)
 SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
 XPATH="${PATHS[$(( $(hb 40) % ${#PATHS[@]} ))]}"
-SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
-SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 # The User-Agent Xray wants here is a KEYWORD, not a header value. The core
 # knows chrome, firefox, safari, edge, curl and golang, and expands each into a
 # full matching set - the real UA plus sec-ch-ua, Accept, Accept-Language and
@@ -1468,12 +1720,10 @@ SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 #
 # It also has to equal the REALITY fingerprint, or uTLS presents itself as one
 # browser while the headers claim another. Both read from FP for that reason.
-# Only these four are valid on both sides, and the seed picks one so the fleet
-# is not uniform while a given node stays stable across re-runs.
-FPS=(chrome firefox safari edge)
-FP="${FPS[$(( $(hb 41) % 4 ))]}"
+# The fleet runs firefox everywhere (owner's decision 2026-09-22): hosts, the
+# REALITY fingerprint and the User-Agent keyword all say the same browser.
+FP=firefox
 UA="$FP"
-SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$CERTNAME/fullchain.pem"
 KEYF="/etc/letsencrypt/live/$CERTNAME/privkey.pem"
 OUT="/root/${DOMAIN}-panel.txt"
@@ -1497,15 +1747,26 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "          \"host\": \"$DOMAIN\", \"path\": \"$XPATH\", \"mode\": \"stream-one\","
   echo '          "xmux": { "maxConnections": "2", "cMaxReuseTimes": "128-256", "hKeepAlivePeriod": 45,'
   echo '                    "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3600" },'
-  echo "          \"extra\": { \"noGRPCHeader\": true, \"seqKey\": \"$SEQ\", \"seqPlacement\": \"path\","
-  echo "                     \"sessionKey\": \"$SES\", \"sessionPlacement\": \"path\","
-  echo "                     \"sessionTable\": \"$SESSTAB\","
-  echo "                     \"sessionLength\": \"16-32\", \"headers\": { \"User-Agent\": \"$UA\" } },"
+  # Only what stream-one actually uses. sessionID/seq do not exist in that mode
+  # (splithttp/dialer.go generates no session id for stream-one), and the old
+  # session* names were renamed to sessionID* in 26.6.22 - Xray ignores unknown
+  # fields silently, so they read like a setting and did nothing.
+  echo "          \"extra\": { \"noGRPCHeader\": true, \"headers\": { \"User-Agent\": \"$UA\" } },"
   echo '          "xPaddingBytes": "100-1000"'
   echo '        },'
   echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
-  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"],"
-  echo "          \"fingerprint\": \"$FP\", \"spiderX\": \"/\" }"
+  # fingerprint and spiderX are client fields; the client gets them from the Host.
+  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"] }"
+  echo '      }'
+  echo '    },'
+  echo '    {'
+  echo "      \"tag\": \"VLESS-REALITY-$SUF\", \"port\": $REALITY_TCP_PORT, \"listen\": \"0.0.0.0\", \"protocol\": \"vless\","
+  echo '      "settings": { "clients": [], "decryption": "none" },'
+  echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
+  echo '      "streamSettings": {'
+  echo '        "network": "raw", "security": "reality",'
+  echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
+  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV2\", \"shortIds\": [\"$SID2\"] }"
   echo '      }'
   echo '    },'
   echo '    {'
@@ -1513,7 +1774,10 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '      "settings": { "clients": [], "version": 2 },'
   echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
   echo '      "streamSettings": { "network": "hysteria", "security": "tls",'
-  echo "        \"finalmask\": { \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\", \"packetSize\": \"512-1200\" },"
+  # Salamander lives in finalmask.udp[]. There is no finalmask.obfs key in the core
+  # (infra/conf FinalMask = tcp, udp, quicParams) and the panel looks for
+  # finalMask.udp[].settings.password too - with obfs both sides silently ran plain QUIC.
+  echo "        \"finalmask\": { \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
   echo '                       "quicParams": { "debug": false, "congestion": "bbr" } },'
   echo '        "tlsSettings": { "alpn": ["h3"],'
   echo "          \"certificates\": [{ \"certificateFile\": \"$CERTF\", \"keyFile\": \"$KEYF\" }] },"
@@ -1539,21 +1803,32 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "xHTTP button:"
   echo "{ \"xmux\": { \"maxConnections\": \"2\", \"cMaxReuseTimes\": \"128-256\", \"hKeepAlivePeriod\": 45,"
   echo "            \"hMaxRequestTimes\": \"600-900\", \"hMaxReusableSecs\": \"1800-3600\" },"
-  echo "  \"seqKey\": \"$SEQ\", \"seqPlacement\": \"path\", \"sessionKey\": \"$SES\", \"sessionPlacement\": \"path\","
-  echo "  \"sessionTable\": \"$SESSTAB\","
-  echo "  \"sessionLength\": \"16-32\", \"noGRPCHeader\": true,"
+  echo "  \"noGRPCHeader\": true,"
   echo "  \"headers\": { \"User-Agent\": \"$UA\" }, \"xPaddingBytes\": \"100-1000\" }"
+  echo
+  echo "--- Host: $DOMAIN [reality] ---"
+  echo "Inbound    : VLESS-REALITY-$SUF"
+  echo "Address    : $DOMAIN / $REALITY_TCP_PORT"
+  echo "SNI        : $DOMAIN"
+  echo "Fingerprint: $FP"
+  echo "Flow       : xtls-rprx-vision - set by the panel itself for raw+REALITY"
+  echo "Remark     : <country>-<n> [Reality]"
   echo
   echo "--- Host: $DOMAIN [hy2] ---"
   echo "Inbound    : HYSTERIA-$SUF"
   echo "Address    : $DOMAIN / 443     ALPN: h3"
-  echo "Final Mask button:"
-  echo "{ \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\" } }"
+  echo "Fingerprint: $FP"
+  echo "Final Mask button (same shape as the inbound - the panel reads udp[].settings.password):"
+  echo "{ \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
+  echo "  \"quicParams\": { \"debug\": false, \"congestion\": \"bbr\" } }"
   echo
   echo "--- node keys ---"
   echo "REALITY privateKey : $PRIV"
   echo "REALITY publicKey  : $PUB"
   echo "shortId            : $SID"
+  echo "REALITY $REALITY_TCP_PORT privateKey: $PRIV2"
+  echo "REALITY $REALITY_TCP_PORT publicKey : $PUB2"
+  echo "REALITY $REALITY_TCP_PORT shortId   : $SID2"
   echo "Salamander         : $SALT"
   echo
   echo "--- masquerade site ---"

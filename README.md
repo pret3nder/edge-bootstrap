@@ -31,6 +31,8 @@ rr check              # health check, read-only
 rr up                 # start the containers and make them stay up
 rr panel              # print the saved panel values again
 rr cert-export        # pack the certificate for the other nodes
+rr firewall           # open what the node serves, close the rest, keep it so
+rr firewall --dry-run # show that plan without touching anything
 ```
 
 It re-downloads the current version rather than copying itself, and syntax-checks the
@@ -85,6 +87,38 @@ rr up
 It deliberately does not run `docker compose pull` — on a compose still pointing at a
 floating tag that would swap the core underneath the node.
 
+## Firewall
+
+The set of inbounds lives in the panel, not on the node: a port appears when an inbound
+is added to the profile and goes away when it is removed. A fixed allow-list here went
+stale both ways — a new inbound stayed unreachable, a removed one stayed open. So the open
+set is derived from the sockets instead:
+
+- `80/tcp`, `443/tcp`, `443/udp`, `2083/tcp` — the layout this script sets up, always open;
+- every public socket owned by `xray`, `nginx` or `sshd`, per protocol;
+- `NODE_PORT` only from the panel address;
+- everything else open to Anywhere is closed.
+
+A port nginx proxies to on the loopback is internal even when the core binds it on
+`0.0.0.0` (a CDN-fronted node), and is not opened.
+
+```bash
+rr firewall            # apply now and arm a timer that re-syncs every 5 minutes
+rr firewall --dry-run  # print the plan, change nothing
+```
+
+It touches nothing but ufw — no keys, no containers — so it is safe on a live node.
+Guards against closing something in use:
+
+- the core has no public socket at all (restarting, profile not pushed yet): nothing is closed;
+- the timer (`--auto`) closes a port only when it was unused on the previous run too;
+- a rule covering an SSH port is never removed;
+- rules limited to a source address are left alone, except `NODE_PORT` rules for anyone
+  but the panel.
+
+`rr check` runs the same plan read-only and reports a served port that is closed as a
+failure, an open port nothing serves as a warning.
+
 ## Bare server
 
 With no node in `/opt/remnanode` the script installs one: docker and compose v2,
@@ -122,16 +156,16 @@ a newer release is verified.
    replacement, the accent is computed in HSL rather than picked from a list, and
    type scale, spacing, page width, font stack, section counts and copy all come
    from separate bytes of the same seed. See below.
-5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
+5. **Configures the firewall** from what the node actually serves — see [Firewall](#firewall).
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.
 6. **Handles the certificate** — per-node, or one wildcard for the whole fleet so
    node hostnames stay out of the Certificate Transparency logs. See below.
 7. **Generates keys** and writes a ready-to-paste config profile plus host values to
-   `/root/<domain>-panel.txt`. The XHTTP `User-Agent` is emitted as an Xray keyword
-   (`chrome`/`firefox`/`safari`/`edge`), which the core expands into a full matching
-   header set, and it is read from the same variable as the REALITY fingerprint so the
-   two cannot disagree.
+   `/root/<domain>-panel.txt`. The fingerprint is `firefox` everywhere: REALITY, every
+   host, and the XHTTP `User-Agent`, which is emitted as an Xray keyword the core expands
+   into a full matching header set. All three read from one variable, so they cannot
+   disagree. The VLESS raw+REALITY inbound gets its own key pair and shortId.
 8. **Makes the node stay up** — enables the docker daemon at boot, raises the restart
    policy in the compose file *and* on the containers that already exist, and installs
    a watchdog timer. See below.
@@ -162,13 +196,21 @@ without visiting each site.
 
 ## Inbounds
 
-`XHTTP-REALITY` on 443/tcp and `Hysteria2` on 443/udp.
+`XHTTP-REALITY` on 443/tcp, `Hysteria2` on 443/udp and `VLESS-REALITY` (raw, Vision) on
+2083/tcp. The last one needs its own port because 443/tcp belongs to XHTTP; the panel
+sets the Vision flow by itself for raw+REALITY. Host remark convention: `<country>-<n> [Reality]`.
 
-VLESS-PQ and HTTPUpgrade are intentionally omitted. Each cost an extra host entry per
+Hysteria2 obfuscation is Salamander in `finalmask.udp[]`, in the inbound and in the host
+Final Mask alike. The core has no `finalmask.obfs` key and ignores unknown fields, so an
+`obfs` block looks like a setting and leaves QUIC unobfuscated. The XHTTP `extra` carries only
+what `stream-one` uses: session and seq parameters do not exist in that mode.
+
+VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted. Each cost an extra host entry per
 node, and PQ on a secondary port served a byte-identical site and certificate to 443 —
-the same content on two ports is an odd thing to expose. With those gone the node
-listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
-443/tcp serves the site, 443/udp answers nothing unless it recognises the traffic.
+the same content on two ports is an odd thing to expose. Trojan on its own TLS port
+drew bans onto nodes. The node listens on 80, 443 and 2083: 80 redirects to HTTPS and
+serves the ACME challenge, 443/tcp and 2083/tcp serve the site to anything that is not
+REALITY, 443/udp answers nothing unless it recognises the traffic.
 
 ## Certificate
 

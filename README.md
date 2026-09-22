@@ -94,7 +94,7 @@ is added to the profile and goes away when it is removed. A fixed allow-list her
 stale both ways — a new inbound stayed unreachable, a removed one stayed open. So the open
 set is derived from the sockets instead:
 
-- `80/tcp`, `443/tcp`, `443/udp` — the layout this script sets up, always open;
+- `80/tcp`, `443/tcp`, `443/udp`, `2083/tcp` — the layout this script sets up, always open;
 - every public socket owned by `xray`, `nginx` or `sshd`, per protocol;
 - `NODE_PORT` only from the panel address;
 - everything else open to Anywhere is closed.
@@ -162,10 +162,10 @@ a newer release is verified.
 6. **Handles the certificate** — per-node, or one wildcard for the whole fleet so
    node hostnames stay out of the Certificate Transparency logs. See below.
 7. **Generates keys** and writes a ready-to-paste config profile plus host values to
-   `/root/<domain>-panel.txt`. The XHTTP `User-Agent` is emitted as an Xray keyword
-   (`chrome`/`firefox`/`safari`/`edge`), which the core expands into a full matching
-   header set, and it is read from the same variable as the REALITY fingerprint so the
-   two cannot disagree.
+   `/root/<domain>-panel.txt`. The fingerprint is `firefox` everywhere: REALITY, every
+   host, and the XHTTP `User-Agent`, which is emitted as an Xray keyword the core expands
+   into a full matching header set. All three read from one variable, so they cannot
+   disagree. The VLESS raw+REALITY inbound gets its own key pair and shortId.
 8. **Makes the node stay up** — enables the docker daemon at boot, raises the restart
    policy in the compose file *and* on the containers that already exist, and installs
    a watchdog timer. See below.
@@ -196,13 +196,16 @@ without visiting each site.
 
 ## Inbounds
 
-`XHTTP-REALITY` on 443/tcp and `Hysteria2` on 443/udp.
+`XHTTP-REALITY` on 443/tcp, `Hysteria2` on 443/udp and `VLESS-REALITY` (raw, Vision) on
+2083/tcp. The last one needs its own port because 443/tcp belongs to XHTTP; the panel
+sets the Vision flow by itself for raw+REALITY. Host remark convention: `<country>-<n> [Reality]`.
 
-VLESS-PQ and HTTPUpgrade are intentionally omitted. Each cost an extra host entry per
+VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted. Each cost an extra host entry per
 node, and PQ on a secondary port served a byte-identical site and certificate to 443 —
-the same content on two ports is an odd thing to expose. With those gone the node
-listens on 80 and 443 only: 80 redirects to HTTPS and serves the ACME challenge,
-443/tcp serves the site, 443/udp answers nothing unless it recognises the traffic.
+the same content on two ports is an odd thing to expose. Trojan on its own TLS port
+drew bans onto nodes. The node listens on 80, 443 and 2083: 80 redirects to HTTPS and
+serves the ACME challenge, 443/tcp and 2083/tcp serve the site to anything that is not
+REALITY, 443/udp answers nothing unless it recognises the traffic.
 
 ## Certificate
 

@@ -34,11 +34,12 @@
 #   7. generates keys and writes a ready-to-paste config profile and host values to a file
 #   8. makes the containers survive a reboot and come back by themselves if they stop
 #
-# Inbounds: XHTTP-REALITY (443/tcp) and Hysteria2 (443/udp).
-# VLESS-PQ and HTTPUpgrade are intentionally omitted: extra listening ports add no value here.
+# Inbounds: XHTTP-REALITY (443/tcp), Hysteria2 (443/udp), VLESS raw+REALITY+Vision (2083/tcp).
+# VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted.
 set -euo pipefail
 
 NODE_IMAGE="remnawave/node:2.8.0"     # core version verified after start
+REALITY_TCP_PORT=2083                 # VLESS raw+REALITY; 443/tcp belongs to XHTTP
 XRAY_EXPECT="26.6.27"
 PANEL_IP="${PANEL_IP:-}"          # see detect_panel_ip
 DIR="/opt/remnanode"
@@ -654,10 +655,10 @@ cmd_cert_export() {
 # ---------------------------------------------------------------------------
 NODE_PORT=2222
 FW_STATE_DIR=/var/lib/rr
-# The node layout this script sets up: ACME/redirect on 80, REALITY on 443/tcp,
-# Hysteria2 on 443/udp. Kept open even before the core is up - certbot needs 80
+# The node layout this script sets up: ACME/redirect on 80, XHTTP+REALITY on
+# 443/tcp, Hysteria2 on 443/udp, VLESS raw+REALITY on 2083/tcp. Kept open even before the core is up - certbot needs 80
 # during a first install, and the containers start only after this step.
-FW_BASE="80/tcp 443/tcp 443/udp"
+FW_BASE="80/tcp 443/tcp 443/udp $REALITY_TCP_PORT/tcp"
 FW_UNIT=/etc/systemd/system/remnanode-fw.service
 FW_TIMER=/etc/systemd/system/remnanode-fw.timer
 
@@ -1699,6 +1700,12 @@ KEYS=$(docker exec remnanode xray x25519 2>/dev/null || true)
 PRIV=$(printf '%s' "$KEYS" | grep -i 'private' | awk '{print $NF}' || true)
 PUB=$(printf '%s' "$KEYS" | grep -i 'public' | awk '{print $NF}' || true)
 SID=$(openssl rand -hex 8)
+# VLESS raw+REALITY (Vision) on its own port gets its own key pair and shortId:
+# one leaked key must not open both inbounds.
+KEYS2=$(docker exec remnanode xray x25519 2>/dev/null || true)
+PRIV2=$(printf '%s' "$KEYS2" | grep -i 'private' | awk '{print $NF}' || true)
+PUB2=$(printf '%s' "$KEYS2" | grep -i 'public' | awk '{print $NF}' || true)
+SID2=$(openssl rand -hex 8)
 SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
@@ -1715,10 +1722,9 @@ SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 #
 # It also has to equal the REALITY fingerprint, or uTLS presents itself as one
 # browser while the headers claim another. Both read from FP for that reason.
-# Only these four are valid on both sides, and the seed picks one so the fleet
-# is not uniform while a given node stays stable across re-runs.
-FPS=(chrome firefox safari edge)
-FP="${FPS[$(( $(hb 41) % 4 ))]}"
+# The fleet runs firefox everywhere (owner's decision 2026-09-22): hosts, the
+# REALITY fingerprint and the User-Agent keyword all say the same browser.
+FP=firefox
 UA="$FP"
 SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$CERTNAME/fullchain.pem"
@@ -1753,6 +1759,16 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
   echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"],"
   echo "          \"fingerprint\": \"$FP\", \"spiderX\": \"/\" }"
+  echo '      }'
+  echo '    },'
+  echo '    {'
+  echo "      \"tag\": \"VLESS-REALITY-$SUF\", \"port\": $REALITY_TCP_PORT, \"listen\": \"0.0.0.0\", \"protocol\": \"vless\","
+  echo '      "settings": { "clients": [], "decryption": "none" },'
+  echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
+  echo '      "streamSettings": {'
+  echo '        "network": "raw", "security": "reality",'
+  echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
+  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV2\", \"shortIds\": [\"$SID2\"] }"
   echo '      }'
   echo '    },'
   echo '    {'
@@ -1791,6 +1807,14 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "  \"sessionLength\": \"16-32\", \"noGRPCHeader\": true,"
   echo "  \"headers\": { \"User-Agent\": \"$UA\" }, \"xPaddingBytes\": \"100-1000\" }"
   echo
+  echo "--- Host: $DOMAIN [reality] ---"
+  echo "Inbound    : VLESS-REALITY-$SUF"
+  echo "Address    : $DOMAIN / $REALITY_TCP_PORT"
+  echo "SNI        : $DOMAIN"
+  echo "Fingerprint: $FP"
+  echo "Flow       : xtls-rprx-vision - set by the panel itself for raw+REALITY"
+  echo "Remark     : <country>-<n> [Reality]"
+  echo
   echo "--- Host: $DOMAIN [hy2] ---"
   echo "Inbound    : HYSTERIA-$SUF"
   echo "Address    : $DOMAIN / 443     ALPN: h3"
@@ -1801,6 +1825,9 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "REALITY privateKey : $PRIV"
   echo "REALITY publicKey  : $PUB"
   echo "shortId            : $SID"
+  echo "REALITY $REALITY_TCP_PORT privateKey: $PRIV2"
+  echo "REALITY $REALITY_TCP_PORT publicKey : $PUB2"
+  echo "REALITY $REALITY_TCP_PORT shortId   : $SID2"
   echo "Salamander         : $SALT"
   echo
   echo "--- masquerade site ---"

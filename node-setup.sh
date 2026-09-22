@@ -1054,7 +1054,12 @@ fi
 # Asked here rather than at issuing time: by then compose, nginx and the site
 # have been rewritten, and stopping to prompt in the middle of that is worse
 # than failing before anything was touched.
-if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] && can_ask; then
+# A node that already holds the wildcard (imported from a bundle) needs no token:
+# the token only issues and renews, and renewal lives on the issuing host. Asking
+# here made every re-run of an importing node hunt for a token it never uses. If
+# the certificate turns out to be invalid, the issuing step below still asks.
+if [ "$CERT_MODE" = "dns" ] && [ -z "${GCORE_TOKEN:-}" ] && [ -z "${CERT_BUNDLE:-}" ] \
+   && [ ! -s "/etc/letsencrypt/live/$CERTNAME/fullchain.pem" ] && can_ask; then
   ask "  Gcore API token" GCORE_TOKEN "$RE_TOKEN" || true
 fi
 

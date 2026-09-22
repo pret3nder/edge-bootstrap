@@ -31,6 +31,8 @@ rr check              # health check, read-only
 rr up                 # start the containers and make them stay up
 rr panel              # print the saved panel values again
 rr cert-export        # pack the certificate for the other nodes
+rr firewall           # open what the node serves, close the rest, keep it so
+rr firewall --dry-run # show that plan without touching anything
 ```
 
 It re-downloads the current version rather than copying itself, and syntax-checks the
@@ -85,6 +87,38 @@ rr up
 It deliberately does not run `docker compose pull` — on a compose still pointing at a
 floating tag that would swap the core underneath the node.
 
+## Firewall
+
+The set of inbounds lives in the panel, not on the node: a port appears when an inbound
+is added to the profile and goes away when it is removed. A fixed allow-list here went
+stale both ways — a new inbound stayed unreachable, a removed one stayed open. So the open
+set is derived from the sockets instead:
+
+- `80/tcp`, `443/tcp`, `443/udp` — the layout this script sets up, always open;
+- every public socket owned by `xray`, `nginx` or `sshd`, per protocol;
+- `NODE_PORT` only from the panel address;
+- everything else open to Anywhere is closed.
+
+A port nginx proxies to on the loopback is internal even when the core binds it on
+`0.0.0.0` (a CDN-fronted node), and is not opened.
+
+```bash
+rr firewall            # apply now and arm a timer that re-syncs every 5 minutes
+rr firewall --dry-run  # print the plan, change nothing
+```
+
+It touches nothing but ufw — no keys, no containers — so it is safe on a live node.
+Guards against closing something in use:
+
+- the core has no public socket at all (restarting, profile not pushed yet): nothing is closed;
+- the timer (`--auto`) closes a port only when it was unused on the previous run too;
+- a rule covering an SSH port is never removed;
+- rules limited to a source address are left alone, except `NODE_PORT` rules for anyone
+  but the panel.
+
+`rr check` runs the same plan read-only and reports a served port that is closed as a
+failure, an open port nothing serves as a warning.
+
 ## Bare server
 
 With no node in `/opt/remnanode` the script installs one: docker and compose v2,
@@ -122,7 +156,7 @@ a newer release is verified.
    replacement, the accent is computed in HSL rather than picked from a list, and
    type scale, spacing, page width, font stack, section counts and copy all come
    from separate bytes of the same seed. See below.
-5. **Configures the firewall**: only `80/tcp`, `443/tcp` and `443/udp` are exposed.
+5. **Configures the firewall** from what the node actually serves — see [Firewall](#firewall).
    `NODE_PORT` is restricted to the panel IP, and any pre-existing wide-open rule for it
    is removed.
 6. **Handles the certificate** — per-node, or one wildcard for the whole fleet so

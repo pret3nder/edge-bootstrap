@@ -200,6 +200,11 @@ without visiting each site.
 2083/tcp. The last one needs its own port because 443/tcp belongs to XHTTP; the panel
 sets the Vision flow by itself for raw+REALITY. Host remark convention: `<country>-<n> [Reality]`.
 
+Hysteria2 obfuscation is Salamander in `finalmask.udp[]`, in the inbound and in the host
+Final Mask alike. The core has no `finalmask.obfs` key and ignores unknown fields, so an
+`obfs` block looks like a setting and leaves QUIC unobfuscated. The XHTTP `extra` carries only
+what `stream-one` uses: session and seq parameters do not exist in that mode.
+
 VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted. Each cost an extra host entry per
 node, and PQ on a secondary port served a byte-identical site and certificate to 443 —
 the same content on two ports is an odd thing to expose. Trojan on its own TLS port

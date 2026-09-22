@@ -1710,8 +1710,6 @@ SALT=$(openssl rand -hex 32)
 SUF=$(printf '%s' "$DOMAIN" | md5sum | cut -c1-4 | tr 'a-z' 'A-Z')
 PATHS=("/api/collect/" "/assets/live/" "/media/segments/" "/v1/events/" "/static/chunks/" "/api/feed/" "/data/sync/" "/pub/updates/")
 XPATH="${PATHS[$(( $(hb 40) % ${#PATHS[@]} ))]}"
-SEQ=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
-SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 # The User-Agent Xray wants here is a KEYWORD, not a header value. The core
 # knows chrome, firefox, safari, edge, curl and golang, and expands each into a
 # full matching set - the real UA plus sec-ch-ua, Accept, Accept-Language and
@@ -1726,7 +1724,6 @@ SES=$(tr -dc 'a-z' </dev/urandom | head -c1 || true)
 # REALITY fingerprint and the User-Agent keyword all say the same browser.
 FP=firefox
 UA="$FP"
-SESSTAB="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CERTF="/etc/letsencrypt/live/$CERTNAME/fullchain.pem"
 KEYF="/etc/letsencrypt/live/$CERTNAME/privkey.pem"
 OUT="/root/${DOMAIN}-panel.txt"
@@ -1750,15 +1747,16 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "          \"host\": \"$DOMAIN\", \"path\": \"$XPATH\", \"mode\": \"stream-one\","
   echo '          "xmux": { "maxConnections": "2", "cMaxReuseTimes": "128-256", "hKeepAlivePeriod": 45,'
   echo '                    "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3600" },'
-  echo "          \"extra\": { \"noGRPCHeader\": true, \"seqKey\": \"$SEQ\", \"seqPlacement\": \"path\","
-  echo "                     \"sessionKey\": \"$SES\", \"sessionPlacement\": \"path\","
-  echo "                     \"sessionTable\": \"$SESSTAB\","
-  echo "                     \"sessionLength\": \"16-32\", \"headers\": { \"User-Agent\": \"$UA\" } },"
+  # Only what stream-one actually uses. sessionID/seq do not exist in that mode
+  # (splithttp/dialer.go generates no session id for stream-one), and the old
+  # session* names were renamed to sessionID* in 26.6.22 - Xray ignores unknown
+  # fields silently, so they read like a setting and did nothing.
+  echo "          \"extra\": { \"noGRPCHeader\": true, \"headers\": { \"User-Agent\": \"$UA\" } },"
   echo '          "xPaddingBytes": "100-1000"'
   echo '        },'
   echo '        "realitySettings": { "show": false, "dest": "/dev/shm/nginx.sock", "xver": 1,'
-  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"],"
-  echo "          \"fingerprint\": \"$FP\", \"spiderX\": \"/\" }"
+  # fingerprint and spiderX are client fields; the client gets them from the Host.
+  echo "          \"serverNames\": [\"$DOMAIN\"], \"privateKey\": \"$PRIV\", \"shortIds\": [\"$SID\"] }"
   echo '      }'
   echo '    },'
   echo '    {'
@@ -1776,7 +1774,10 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '      "settings": { "clients": [], "version": 2 },'
   echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
   echo '      "streamSettings": { "network": "hysteria", "security": "tls",'
-  echo "        \"finalmask\": { \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\", \"packetSize\": \"512-1200\" },"
+  # Salamander lives in finalmask.udp[]. There is no finalmask.obfs key in the core
+  # (infra/conf FinalMask = tcp, udp, quicParams) and the panel looks for
+  # finalMask.udp[].settings.password too - with obfs both sides silently ran plain QUIC.
+  echo "        \"finalmask\": { \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
   echo '                       "quicParams": { "debug": false, "congestion": "bbr" } },'
   echo '        "tlsSettings": { "alpn": ["h3"],'
   echo "          \"certificates\": [{ \"certificateFile\": \"$CERTF\", \"keyFile\": \"$KEYF\" }] },"
@@ -1802,9 +1803,7 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "xHTTP button:"
   echo "{ \"xmux\": { \"maxConnections\": \"2\", \"cMaxReuseTimes\": \"128-256\", \"hKeepAlivePeriod\": 45,"
   echo "            \"hMaxRequestTimes\": \"600-900\", \"hMaxReusableSecs\": \"1800-3600\" },"
-  echo "  \"seqKey\": \"$SEQ\", \"seqPlacement\": \"path\", \"sessionKey\": \"$SES\", \"sessionPlacement\": \"path\","
-  echo "  \"sessionTable\": \"$SESSTAB\","
-  echo "  \"sessionLength\": \"16-32\", \"noGRPCHeader\": true,"
+  echo "  \"noGRPCHeader\": true,"
   echo "  \"headers\": { \"User-Agent\": \"$UA\" }, \"xPaddingBytes\": \"100-1000\" }"
   echo
   echo "--- Host: $DOMAIN [reality] ---"
@@ -1818,8 +1817,10 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "--- Host: $DOMAIN [hy2] ---"
   echo "Inbound    : HYSTERIA-$SUF"
   echo "Address    : $DOMAIN / 443     ALPN: h3"
-  echo "Final Mask button:"
-  echo "{ \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\" } }"
+  echo "Fingerprint: $FP"
+  echo "Final Mask button (same shape as the inbound - the panel reads udp[].settings.password):"
+  echo "{ \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
+  echo "  \"quicParams\": { \"debug\": false, \"congestion\": \"bbr\" } }"
   echo
   echo "--- node keys ---"
   echo "REALITY privateKey : $PRIV"

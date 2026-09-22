@@ -200,9 +200,11 @@ without visiting each site.
 2083/tcp. The last one needs its own port because 443/tcp belongs to XHTTP; the panel
 sets the Vision flow by itself for raw+REALITY. Host remark convention: `<country>-<n> [Reality]`.
 
-Hysteria2 obfuscation is Salamander in `finalmask.udp[]`, in the inbound and in the host
-Final Mask alike. The core has no `finalmask.obfs` key and ignores unknown fields, so an
-`obfs` block looks like a setting and leaves QUIC unobfuscated. The XHTTP `extra` carries only
+Hysteria2 is generated in the fleet's shape, `finalmask.obfs`. The core has no such key and
+ignores unknown fields, so QUIC runs unobfuscated, as on every other node. The working form
+is Salamander in `finalmask.udp[]` (inbound and host Final Mask alike); switching one node
+to it made clients stop connecting, so it is meant for the whole fleet at once, with the
+same passwords. The XHTTP `extra` carries only
 what `stream-one` uses: session and seq parameters do not exist in that mode.
 
 VLESS-PQ, HTTPUpgrade and Trojan are intentionally omitted. Each cost an extra host entry per

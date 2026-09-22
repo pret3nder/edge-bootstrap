@@ -126,13 +126,15 @@ if [ -s "$P" ]; then
   grep -q 'REALITY 2083 privateKey' "$P" && echo "  ✓ отдельные ключи для 2083 записаны" \
     || { echo "  ⚠ нет ключей для 2083"; fail=1; }
   grep -q 'Trojan\|8443' "$P" && { echo "  ⚠ в профиле снова Trojan/8443"; fail=1; } || echo "  ✓ Trojan не генерируется"
-  # Xray молча игнорирует неизвестные поля. finalmask.obfs в ядре нет и не было:
-  # Salamander живёт в finalmask.udp[], и панель ищет там же - с obfs обе стороны
-  # тихо работали голым QUIC. session*/seq* при stream-one не существуют вовсе.
-  grep -q '"obfs"' "$P" && { echo "  ⚠ снова finalmask.obfs (Salamander выключен)"; fail=1; } || echo "  ✓ нет finalmask.obfs"
-  s=$(grep -c '"udp": \[{ "type": "salamander", "settings": { "password": "' "$P" || true)
-  [ "$s" = 2 ] && echo "  ✓ Salamander в finalmask.udp[] - в инбаунде и в Host" \
-    || { echo "  ⚠ Salamander в udp[] найден $s раз, ожидалось 2 (инбаунд + Host)"; fail=1; }
+  # Hysteria2 - как на всём парке: finalmask.obfs (ядро его не знает = голый QUIC).
+  # Рабочий udp[] включали на одной ноде 2026-09-22 - клиенты отвалились, откатили.
+  # Включать только на всём парке разом, не с новой ноды.
+  s=$(grep -c '"obfs": { "type": "salamander", "password": "' "$P" || true)
+  [ "$s" = 2 ] && echo "  ✓ Salamander в форме парка (obfs) - в инбаунде и в Host" \
+    || { echo "  ⚠ obfs-Salamander найден $s раз, ожидалось 2 (инбаунд + Host)"; fail=1; }
+  grep -q '"udp": \[{ "type": "salamander"' "$P" && { echo "  ⚠ udp[]-Salamander на одной ноде - клиенты парка не подключатся"; fail=1; } \
+    || echo "  ✓ нет udp[]-Salamander"
+  # session*/seq* при stream-one не существуют вовсе.
   grep -qE '"(seqKey|seqPlacement|sessionKey|sessionPlacement|sessionTable|sessionLength|sessionID[A-Za-z]*)"' "$P" \
     && { echo "  ⚠ мёртвые session*/seq* при stream-one"; fail=1; } || echo "  ✓ нет мёртвых session*/seq*"
   grep -qE '"(spiderX|fingerprint)"' "$P" && { echo "  ⚠ клиентские поля REALITY в серверном инбаунде"; fail=1; } \

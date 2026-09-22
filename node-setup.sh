@@ -1779,10 +1779,14 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo '      "settings": { "clients": [], "version": 2 },'
   echo '      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true },'
   echo '      "streamSettings": { "network": "hysteria", "security": "tls",'
-  # Salamander lives in finalmask.udp[]. There is no finalmask.obfs key in the core
-  # (infra/conf FinalMask = tcp, udp, quicParams) and the panel looks for
-  # finalMask.udp[].settings.password too - with obfs both sides silently ran plain QUIC.
-  echo "        \"finalmask\": { \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
+  # Deliberately the fleet's shape: finalmask.obfs. The core has no such key
+  # (FinalMask = tcp, udp, quicParams) and the panel reads finalMask.udp[], so this
+  # runs plain QUIC - exactly like every other node. The working form,
+  #   "udp": [{ "type": "salamander", "settings": { "password": ..., "packetSize": ... } }]
+  # was tried on one node on 2026-09-22 and clients stopped connecting until it was
+  # rolled back. Switch it fleet-wide or not at all, and keep the password: it is
+  # what the switch will reuse.
+  echo "        \"finalmask\": { \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\", \"packetSize\": \"512-1200\" },"
   echo '                       "quicParams": { "debug": false, "congestion": "bbr" } },'
   echo '        "tlsSettings": { "alpn": ["h3"],'
   echo "          \"certificates\": [{ \"certificateFile\": \"$CERTF\", \"keyFile\": \"$KEYF\" }] },"
@@ -1823,9 +1827,8 @@ OUT="/root/${DOMAIN}-panel.txt"
   echo "Inbound    : HYSTERIA-$SUF"
   echo "Address    : $DOMAIN / 443     ALPN: h3"
   echo "Fingerprint: $FP"
-  echo "Final Mask button (same shape as the inbound - the panel reads udp[].settings.password):"
-  echo "{ \"udp\": [{ \"type\": \"salamander\", \"settings\": { \"password\": \"$SALT\", \"packetSize\": \"512-1200\" } }],"
-  echo "  \"quicParams\": { \"debug\": false, \"congestion\": \"bbr\" } }"
+  echo "Final Mask button (the fleet's shape, see the inbound above):"
+  echo "{ \"obfs\": { \"type\": \"salamander\", \"password\": \"$SALT\" } }"
   echo
   echo "--- node keys ---"
   echo "REALITY privateKey : $PRIV"
